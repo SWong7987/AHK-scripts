@@ -1,40 +1,9 @@
-name: Convert EQUATIONS ZIP to raw source
+name: EQUATIONS source transfer test
 
-on:
-  issues:
-    types: [opened]
-  workflow_dispatch:
-
-permissions:
-  contents: write
+on: [push]
 
 jobs:
-  extract:
-    if: github.event_name == 'workflow_dispatch' || github.event.issue.title == 'TEMP: unpack EQUATIONS source'
+  test:
     runs-on: ubuntu-latest
     steps:
-      - name: Check out main
-        uses: actions/checkout@v4
-        with:
-          ref: main
-
-      - name: Extract raw AutoHotkey source
-        shell: bash
-        run: |
-          set -euo pipefail
-          tmpdir="$(mktemp -d)"
-          unzip -o AcademicGames_Equations/AcademicGames_Equations_v4.4.zip -d "$tmpdir"
-          source_file="$(find "$tmpdir" -maxdepth 2 -type f -name '*.ahk' -print -quit)"
-          test -n "$source_file"
-          cp "$source_file" AcademicGames_Equations/AcademicGames_Equations.ahk
-          rm AcademicGames_Equations/AcademicGames_Equations_v4.4.zip
-
-      - name: Commit raw source
-        shell: bash
-        run: |
-          set -euo pipefail
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add AcademicGames_Equations/AcademicGames_Equations.ahk AcademicGames_Equations/AcademicGames_Equations_v4.4.zip
-          git commit -m "Replace EQUATIONS ZIP with raw AutoHotkey source"
-          git push origin main
+      - run: echo "workflow works"
