@@ -19,7 +19,8 @@ jobs:
               AcademicGames_Equations/.transfer/part01.b64 \
               AcademicGames_Equations/.transfer/part02.b64 \
               AcademicGames_Equations/.transfer/part03.b64 \
-            | base64 -d | gzip -d > AcademicGames_Equations/AcademicGames_Equations.ahk
+            | base64 -d > /tmp/equations-source.gz
+          gzip -dc /tmp/equations-source.gz > AcademicGames_Equations/AcademicGames_Equations.ahk 2>/dev/null || true
           actual="$(sha256sum AcademicGames_Equations/AcademicGames_Equations.ahk | awk '{print $1}')"
           expected="22c701562164b3aa8782e2299ac39cdd9e5a00566d9e2823e5270a2dae1aeb48"
           test "$actual" = "$expected"
