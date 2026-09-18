@@ -1,0 +1,44 @@
+name: Promote EQUATIONS v4.6.4
+
+on:
+  push:
+    paths:
+      - 'AcademicGames_Equations/.transfer-v464/**'
+      - '.github/workflows/promote-equations-v464.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  promote:
+    if: ${{ github.actor != 'github-actions[bot]' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Reconstruct and verify tested source
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat AcademicGames_Equations/.transfer-v464/part*.b64 > /tmp/equations-v464.b64
+          base64 -d /tmp/equations-v464.b64 | gzip -d > AcademicGames_Equations/AcademicGames_Equations.ahk
+          echo "9c244e8fb71c2e4009a8bf8e06d3d7581afa4aeed8d558dc1b5f456c5375ce73  AcademicGames_Equations/AcademicGames_Equations.ahk" | sha256sum -c -
+          test "$(wc -c < AcademicGames_Equations/AcademicGames_Equations.ahk)" -eq 160681
+
+      - name: Remove temporary transfer material
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf AcademicGames_Equations/.transfer-v464
+          rm -f .github/workflows/promote-equations-v464.yml
+
+      - name: Commit tested v4.6.4
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Promote EQUATIONS v4.6.4 bot release"
+          git push origin main
