@@ -1,8 +1,8 @@
 ﻿#Requires AutoHotkey v2.0
-#SingleInstance Force
+#SingleInstance Off
 
 ; ============================================================================
-; ACADEMIC GAMES EQUATIONS - LOCAL HOT-SEAT PRACTICE v4.6.4
+; ACADEMIC GAMES EQUATIONS - LOCAL HOT-SEAT PRACTICE v4.9.2
 ; AutoHotkey v2.0
 ;
 ; Basic EQUATIONS only - NO Adventurous variations yet.
@@ -91,6 +91,56 @@
 ;       * large values are formatted without overflowing Round()
 ;       * Ctrl+Shift+T verifies 8^30 against its known magnitude and the 32nd root of 0
 ;
+
+;   - v4.7 adds the three-mode launcher and parallel Bot Lab:
+;       * PLAY GAME keeps 2-3 mixed Human/bot seats for ordinary play
+;       * WATCH BOT GAME preserves the visible lightning-fast board with selectable bots
+;       * MULTI-INSTANCE BOT LAB launches many independent 2- or 3-bot games at once
+;       * multi-instance workers can show all boards, show one board, or run hidden
+;       * every worker receives a deterministic seed so a run can be reproduced
+;       * a controller window reports worker progress, seeds, search counts, and failures
+;       * hidden workers suppress board repainting for substantially higher stress-test throughput
+;       * lightweight state invariants stop a worker if cube/zone bookkeeping becomes inconsistent
+;       * worker status/failure reports are written to a temporary run folder for debugging
+;     The v4.6.4 referee, parser, challenge, scoring, timer, and bot search paths are retained.
+;
+;   - v4.7.2 expands the Bot Lab controller / performance tooling:
+;       * adds a fourth startup mode that benchmarks hidden-worker throughput
+;         across several worker counts to find the best tested count for this PC
+;       * benchmark results report elapsed time and aggregate shakes per second
+;       * Multi-Instance Bot Lab adds Copy All Bot Moves, grouped by worker/seed
+;       * worker move logs are buffered and flushed in batches to reduce benchmark I/O cost
+;       * bot BONUS choices are included in the per-worker move logs
+;       * hidden Bot Lab workers no longer respond to the diagnostic/self-test hotkeys
+;     Core v4.7 gameplay, referee, parser, scoring, challenge, and solver behavior is unchanged.
+;
+;   - v4.8 is a solver-throughput optimization pass built on the tested v4.7.2 engine:
+;       * removes repeated full-array shuffles from the hot expression-builder loop
+;         and uses O(1)-style random pop/swap selection instead
+;       * partially samples optional board pools instead of shuffling every candidate cube
+;       * selects the Goal target before expression construction and tries both legal
+;         final operand orientations when that can satisfy the target exactly
+;       * caches legal Goal interpretations for an unchanged Goal/division
+;       * adds an integer-only deterministic RNG fast path for hot solver operations
+;       * accelerates negative-base powers with an integer-exponent fast path
+;       * retains the ordinary referee checker as the final acceptance gate for every
+;         bot-generated Equation; no scoring, challenge, parser, or tournament rules changed
+;
+;   - v4.9.2 keeps the v4.9 strategic Very Hard bot while recovering v4.8-style speed:
+;       * ordinary moves use cheap scoring -> one tiny NOW screen -> two deeper finalists
+;         instead of searching for both NOW and IMPOSSIBLE evidence on every shortlist item
+;       * Required has strong diminishing returns, duplicate Required faces are penalized,
+;         and Permitted becomes increasingly valuable as the Required pile grows
+;       * all Very Hard opponents share one 1000-trial NOW search for the same public board
+;         state instead of independently repeating 900 trials each; this is deeper than the
+;         old per-bot check while eliminating duplicate computation in 3-player games
+;       * a shared NOW witness is cached for every eligible Very Hard opponent, so the third
+;         party can reuse the exact referee-valid Equation rather than searching again
+;       * strategic BONUS examines only its single best structural candidate before tactical
+;         verification, preserving purposeful denial without doubling the normal-turn cost
+;       * Goal strategy, final-cube FORCEOUT reasoning, referee/parser/scoring/timing rules,
+;         and the v4.8 optimized expression solver remain unchanged
+;;
 ;   - v4.6.3 corrects the v4.6.2 high-power/root self-test:
 ;       * the regression now tests the arithmetic primitives directly instead of
 ;         requiring the ambiguity-aware parser to expose exactly one internal result
@@ -145,6 +195,54 @@ global BotSearchSuccesses := 0
 global BotSearchFailures := 0
 global BotDiagnosticLines := []
 global BotCachedEquationEntries := Map()
+
+; v4.8 solver cache. The key includes Division and the exact physical Goal
+; expression, so cached interpretations automatically invalidate when either changes.
+global BotGoalInterpretationCacheKey := ""
+global BotGoalInterpretationCache := []
+
+; v4.7 launcher / deterministic RNG / multi-instance Bot Lab state.
+global AppMode := "Play"
+global SeededRandomEnabled := false
+global SeedState := 1
+global SessionSeed := 0
+global RenderEnabled := true
+
+global BotLabWorker := false
+global BotLabWorkerId := 0
+global BotLabWorkerVisible := false
+global BotLabRunId := ""
+global BotLabStatusDir := ""
+global BotLabStatusFile := ""
+global BotLabFailureDetected := false
+global BotLabFailureReason := ""
+
+global BotLabControllerGui := 0
+global BotLabControllerEdit := 0
+global BotLabControllerStatusText := 0
+global BotLabControllerSummary := ""
+global BotLabWorkerPids := []
+global BotLabControllerConfig := Map()
+global BotLabMoveLogFile := ""
+global BotLabMoveBuffer := []
+global BotLabMoveSequence := 0
+
+; v4.7.2 PC benchmark controller state.
+global BenchmarkGui := 0
+global BenchmarkEdit := 0
+global BenchmarkStatusText := 0
+global BenchmarkProgressBar := 0
+global BenchmarkConfig := Map()
+global BenchmarkStages := []
+global BenchmarkStageIndex := 0
+global BenchmarkResults := []
+global BenchmarkWorkerPids := []
+global BenchmarkCurrentConfig := Map()
+global BenchmarkCurrentStartTick := 0
+global BenchmarkStopped := false
+global BenchmarkSummary := ""
+global BenchmarkRootDir := ""
+
 global Totals := []
 global ShakeDelta := []
 global MatchPoints := []
@@ -271,45 +369,117 @@ global ForceoutStartTick := 0
 
 ; --------------------------------- START -----------------------------------
 
-if !SetupPlayers()
+launchArgs := ParseLaunchArgs()
+
+; Worker copies bypass all startup prompts. Their complete configuration is
+; supplied by the multi-instance controller on the command line.
+if launchArgs.Has("worker") {
+    if !SetupBotLabWorker(launchArgs)
+        ExitApp()
+
+    BuildGui()
+    if SeededRandomEnabled
+        AddLog("Deterministic session seed: " . SessionSeed . ".")
+    GoalSetter := DetermineFirstGoalSetter()
+    ShowGameWindow()
+    StartShake(false)
+    WriteBotLabWorkerStatus("RUNNING")
+    ScheduleBotController()
+    return
+}
+
+AppMode := ChooseStartupMode()
+if (AppMode = "")
     ExitApp()
 
-BuildGui()
-GoalSetter := DetermineFirstGoalSetter()
+if (AppMode = "MultiBotLab") {
+    if !SetupMultiBotLabController()
+        ExitApp()
+    return
+}
 
- ; Show the stable v4.0 board, then render the first shake.
-MainGui.Show("w1320 h900")
+if (AppMode = "Benchmark") {
+    if !SetupPcBenchmark()
+        ExitApp()
+    return
+}
+
+if (AppMode = "Play") {
+    if !SetupPlayGamePlayers()
+        ExitApp()
+} else if (AppMode = "WatchBots") {
+    if !SetupWatchBotGame()
+        ExitApp()
+} else {
+    ExitApp()
+}
+
+BuildGui()
+if SeededRandomEnabled
+    AddLog("Deterministic session seed: " . SessionSeed . ".")
+GoalSetter := DetermineFirstGoalSetter()
+ShowGameWindow()
 StartShake(false)
 ScheduleBotController()
 return
 
 ; ============================================================================
-; PLAYER / MATCH SETUP
+; v4.7 STARTUP / PLAYER / MATCH SETUP
 ; ============================================================================
 
-SetupPlayers() {
-    global PlayerCount, Players, PlayerTypes, Division, Totals, ShakeDelta, MatchPoints
-    global BotAutoRun, BotAutoRunMaxShakes, BotDelayMs
+ChooseStartupMode() {
+    global StartupModeChoice
 
+    StartupModeChoice := ""
+    g := Gui("+AlwaysOnTop", "Academic Games EQUATIONS v4.9.2")
+    g.SetFont("s10", "Segoe UI")
+    g.Add("Text", "x20 y16 w560 h34 Center", "Choose how you want to run EQUATIONS")
+    g.Add("Text", "x25 y49 w550 h42 Center", "Play, watch one lightning-fast bot table, unleash many tables, or benchmark the best worker count for this PC.")
+
+    b1 := g.Add("Button", "x35 y100 w510 h62", "1. PLAY GAME`nHumans and/or bots - 2 or 3 players")
+    b2 := g.Add("Button", "x35 y174 w510 h62", "2. WATCH BOT GAME`nOne visible lightning-fast bot table")
+    b3 := g.Add("Button", "x35 y248 w510 h70", "3. MULTI-INSTANCE BOT LAB`nMany bot tables - show all, show one, or hide them")
+    b4 := g.Add("Button", "x35 y330 w510 h70", "4. PC BENCHMARK`nAutomatically test hidden worker counts and find the fastest setup")
+    cancel := g.Add("Button", "x210 y420 w160 h36", "Cancel")
+
+    b1.OnEvent("Click", StartupModeSelected.Bind(g, "Play"))
+    b2.OnEvent("Click", StartupModeSelected.Bind(g, "WatchBots"))
+    b3.OnEvent("Click", StartupModeSelected.Bind(g, "MultiBotLab"))
+    b4.OnEvent("Click", StartupModeSelected.Bind(g, "Benchmark"))
+    cancel.OnEvent("Click", StartupModeSelected.Bind(g, ""))
+    g.OnEvent("Close", StartupModeSelected.Bind(g, ""))
+
+    hwnd := g.Hwnd
+    g.Show("w580 h475")
+    WinWaitClose("ahk_id " . hwnd)
+    return StartupModeChoice
+}
+
+StartupModeSelected(guiObj, mode, *) {
+    global StartupModeChoice
+    StartupModeChoice := mode
+    guiObj.Destroy()
+}
+
+PromptPlayerCount(title := "EQUATIONS - Players", defaultValue := "3") {
     loop {
         result := InputBox(
             "Enter the number of players.`n`nOfficial EQUATIONS matches use 2 or 3 players.",
-            "EQUATIONS - Players",
+            title,
             "w410 h175",
-            "3"
+            defaultValue
         )
-
         if (result.Result != "OK")
-            return false
-
+            return 0
         value := Trim(result.Value)
-        if RegExMatch(value, "^[23]$") {
-            PlayerCount := value + 0
-            break
-        }
-
+        if RegExMatch(value, "^[23]$")
+            return value + 0
         MsgBox("Please enter only 2 or 3.", "Invalid player count")
     }
+}
+
+PromptDivision() {
+    global Division
 
     loop {
         divResult := InputBox(
@@ -318,34 +488,89 @@ SetupPlayers() {
             "w430 h245",
             "Middle"
         )
-
         if (divResult.Result != "OK")
             return false
 
         value := StrLower(Trim(divResult.Value))
         if (value = "e" || value = "elementary") {
             Division := "Elementary"
-            break
+            return true
         }
         if (value = "m" || value = "middle") {
             Division := "Middle"
-            break
+            return true
         }
         if (value = "j" || value = "junior") {
             Division := "Junior"
-            break
+            return true
         }
         if (value = "s" || value = "senior") {
             Division := "Senior"
-            break
+            return true
         }
-
         MsgBox("Enter Elementary, Middle, Junior, Senior, or E/M/J/S.", "Invalid division")
     }
+}
+
+PromptPlayerType(playerNumber, allowHuman := true, allowRandom := false, titlePrefix := "EQUATIONS") {
+    loop {
+        choices := "P = Practice Bot`nV = Very Hard Bot`nR = Rules Fuzzer`nF = Parser Fuzzer`nC = Chaos Fuzzer"
+        defaultValue := "Very Hard"
+        if allowHuman {
+            choices := "H = Human`n" . choices
+            defaultValue := "Human"
+        }
+        if allowRandom
+            choices .= "`nX = Random bot for this seat"
+
+        typeResult := InputBox(
+            "Choose Player " . playerNumber . "'s controller:`n`n" . choices,
+            titlePrefix . " - Player " . playerNumber . " Type",
+            "w455 h315",
+            defaultValue
+        )
+        if (typeResult.Result != "OK")
+            return ""
+
+        raw := StrLower(Trim(typeResult.Value))
+        if (allowRandom && (raw = "x" || raw = "random" || raw = "random bot"))
+            return "Random Bot"
+
+        playerType := NormalizePlayerType(typeResult.Value)
+        if (playerType != "" && (allowHuman || playerType != "Human"))
+            return playerType
+
+        allowedText := allowHuman ? "Human, Practice, Very Hard, Rules Fuzzer, Parser Fuzzer, Chaos Fuzzer" : "Practice, Very Hard, Rules Fuzzer, Parser Fuzzer, or Chaos Fuzzer"
+        if allowRandom
+            allowedText .= ", or Random"
+        MsgBox("Enter " . allowedText . ".", "Invalid player type")
+    }
+}
+
+InitializePlayerScores() {
+    global PlayerCount, Totals, ShakeDelta, MatchPoints
+    Totals := []
+    ShakeDelta := []
+    MatchPoints := []
+    loop PlayerCount {
+        Totals.Push(0)
+        ShakeDelta.Push(0)
+        MatchPoints.Push(0)
+    }
+}
+
+SetupPlayGamePlayers() {
+    global PlayerCount, Players, PlayerTypes, BotAutoRun, BotDelayMs
+    global SeededRandomEnabled, SessionSeed, RenderEnabled
+
+    PlayerCount := PromptPlayerCount("EQUATIONS - Play Game")
+    if !PlayerCount
+        return false
+    if !PromptDivision()
+        return false
 
     Players := []
     PlayerTypes := []
-
     loop PlayerCount {
         i := A_Index
         nameResult := InputBox(
@@ -354,96 +579,1291 @@ SetupPlayers() {
             "w410 h150",
             "Player " . i
         )
-
         if (nameResult.Result != "OK")
             return false
-
         name := Trim(nameResult.Value)
         if (name = "")
             name := "Player " . i
 
-        loop {
-            typeResult := InputBox(
-                "Choose Player " . i . "'s controller:`n`n"
-                . "H = Human`n"
-                . "P = Practice Bot`n"
-                . "V = Very Hard Bot`n"
-                . "R = Rules Fuzzer`n"
-                . "F = Parser Fuzzer`n"
-                . "C = Chaos Fuzzer`n`n"
-                . "Human is the default and preserves normal v4.5 hot-seat play.",
-                "EQUATIONS - Player " . i . " Type",
-                "w455 h310",
-                "Human"
-            )
-
-            if (typeResult.Result != "OK")
-                return false
-
-            playerType := NormalizePlayerType(typeResult.Value)
-            if (playerType != "")
-                break
-
-            MsgBox("Enter Human, Practice, Very Hard, Rules Fuzzer, Parser Fuzzer, Chaos Fuzzer, or H/P/V/R/F/C.", "Invalid player type")
-        }
+        playerType := PromptPlayerType(i, true, false, "EQUATIONS - Play Game")
+        if (playerType = "")
+            return false
 
         if (name = "Player " . i && playerType != "Human")
             name := BotTypeLabel(playerType) . " " . i
-
         Players.Push(name)
         PlayerTypes.Push(playerType)
     }
 
-    Totals := []
-    ShakeDelta := []
-    MatchPoints := []
+    InitializePlayerScores()
+    BotAutoRun := false
+    BotDelayMs := 650
+    SeededRandomEnabled := false
+    SessionSeed := 0
+    RenderEnabled := true
+    return true
+}
 
-    loop PlayerCount {
-        Totals.Push(0)
-        ShakeDelta.Push(0)
-        MatchPoints.Push(0)
+PromptPositiveInteger(prompt, title, defaultValue, minValue := 1, maxValue := 1000000) {
+    loop {
+        result := InputBox(prompt, title, "w470 h185", defaultValue)
+        if (result.Result != "OK")
+            return 0
+        text := Trim(result.Value)
+        if RegExMatch(text, "^\d+$") {
+            value := text + 0
+            if (value >= minValue && value <= maxValue)
+                return value
+        }
+        MsgBox("Enter a whole number from " . minValue . " to " . maxValue . ".", "Invalid number")
+    }
+}
+
+PromptBotSpeed(defaultCode := "L") {
+    loop {
+        result := InputBox(
+            "Choose bot speed.`n`nL = Lightning (30 ms between bot actions - current visible Bot Lab feel)`nF = Fast (100 ms)`nX = Maximum (1 ms; best for hidden stress testing)",
+            "EQUATIONS - Bot Speed",
+            "w520 h220",
+            defaultCode
+        )
+        if (result.Result != "OK")
+            return 0
+        v := StrLower(Trim(result.Value))
+        if (v = "l" || v = "lightning")
+            return 30
+        if (v = "f" || v = "fast")
+            return 100
+        if (v = "x" || v = "maximum" || v = "max")
+            return 1
+        MsgBox("Enter L, F, or X.", "Invalid speed")
+    }
+}
+
+PromptSeed(title := "EQUATIONS - Seed") {
+    result := InputBox(
+        "Enter a deterministic seed from 1 to 2147483646.`n`nLeave it blank to generate a random seed. Reusing the same seed with the same bot configuration reproduces the same random sequence.",
+        title,
+        "w520 h215",
+        ""
+    )
+    if (result.Result != "OK")
+        return {OK: false, Value: 0}
+
+    text := Trim(result.Value)
+    if (text = "")
+        return {OK: true, Value: GenerateRandomSeed()}
+
+    if RegExMatch(text, "^\d+$") {
+        value := text + 0
+        if (value >= 1 && value <= 2147483646)
+            return {OK: true, Value: value}
     }
 
-    ; If every seat is automated, offer a fast regression-lab mode. It does
-    ; not alter legal move/checker logic; it only removes human pacing/dialogs
-    ; between shakes so fuzzers can traverse many states quickly.
-    allBots := true
+    MsgBox("The seed must be a whole number from 1 to 2147483646.", "Invalid seed")
+    return PromptSeed(title)
+}
+
+SetupWatchBotGame() {
+    global PlayerCount, Players, PlayerTypes, BotAutoRun, BotAutoRunMaxShakes, BotDelayMs
+    global RenderEnabled
+
+    PlayerCount := PromptPlayerCount("EQUATIONS - Watch Bot Game")
+    if !PlayerCount
+        return false
+    if !PromptDivision()
+        return false
+
+    Players := []
+    PlayerTypes := []
     loop PlayerCount {
-        if (PlayerTypes[A_Index] = "Human") {
-            allBots := false
+        playerType := PromptPlayerType(A_Index, false, false, "EQUATIONS - Watch Bot Game")
+        if (playerType = "")
+            return false
+        PlayerTypes.Push(playerType)
+        Players.Push(BotTypeLabel(playerType) . " " . A_Index)
+    }
+
+    shakes := PromptPositiveInteger(
+        "How many shakes should the visible bot game run before pausing?`n`nYou can enter 1-100000.",
+        "EQUATIONS - Watch Bot Game",
+        "20",
+        1,
+        100000
+    )
+    if !shakes
+        return false
+
+    delay := PromptBotSpeed("L")
+    if !delay
+        return false
+
+    seedInfo := PromptSeed("EQUATIONS - Watch Bot Game Seed")
+    if !seedInfo.OK
+        return false
+    SetSessionSeed(seedInfo.Value)
+
+    InitializePlayerScores()
+    BotAutoRun := true
+    BotAutoRunMaxShakes := shakes
+    BotDelayMs := delay
+    RenderEnabled := true
+    return true
+}
+
+SetupMultiBotLabController() {
+    global BotLabControllerConfig, BotLabWorkerPids, BotLabRunId, BotLabStatusDir, Division
+
+    defaultWorkers := 4
+    try {
+        cpuText := EnvGet("NUMBER_OF_PROCESSORS")
+        if RegExMatch(cpuText, "^\d+$")
+            defaultWorkers := Max(1, Min(8, Floor((cpuText + 0) / 2)))
+    }
+
+    workers := PromptPositiveInteger(
+        "How many simultaneous EQUATIONS games should run?`n`n1-32 workers are allowed. More workers use more CPU and memory.",
+        "EQUATIONS - Multi-Instance Bot Lab",
+        defaultWorkers,
+        1,
+        32
+    )
+    if !workers
+        return false
+
+    if (workers > 8) {
+        answer := MsgBox(
+            "You are about to launch " . workers . " independent AutoHotkey workers.`n`nThis can use a lot of CPU and memory. Continue?",
+            "Large Bot Lab",
+            "YesNo"
+        )
+        if (answer != "Yes")
+            return false
+    }
+
+    playerCount := PromptPlayerCount("EQUATIONS - Players Per Bot Lab Game")
+    if !playerCount
+        return false
+    if !PromptDivision()
+        return false
+
+    botTypes := []
+    loop playerCount {
+        t := PromptPlayerType(A_Index, false, true, "EQUATIONS - Multi Bot Lab")
+        if (t = "")
+            return false
+        botTypes.Push(t)
+    }
+
+    shakes := PromptPositiveInteger(
+        "How many shakes should EACH worker run?`n`nExamples:`n100 = quick test`n5000 = serious stress test`n100000 = very long torture test",
+        "EQUATIONS - Shakes Per Worker",
+        "1000",
+        1,
+        1000000
+    )
+    if !shakes
+        return false
+
+    visibility := ""
+    loop {
+        visResult := InputBox(
+            "How should worker boards be displayed?`n`nA = Show ALL worker boards`nO = Show ONE worker board (Worker 1)`nH = HIDE all boards for maximum throughput",
+            "EQUATIONS - Worker Visibility",
+            "w500 h215",
+            "O"
+        )
+        if (visResult.Result != "OK")
+            return false
+        v := StrLower(Trim(visResult.Value))
+        if (v = "a" || v = "all") {
+            visibility := "ALL"
+            break
+        }
+        if (v = "o" || v = "one" || v = "show one") {
+            visibility := "ONE"
+            break
+        }
+        if (v = "h" || v = "hidden" || v = "hide") {
+            visibility := "HIDDEN"
+            break
+        }
+        MsgBox("Enter A, O, or H.", "Invalid visibility")
+    }
+
+    defaultSpeed := (visibility = "HIDDEN") ? "X" : "L"
+    delay := PromptBotSpeed(defaultSpeed)
+    if !delay
+        return false
+
+    seedInfo := PromptSeed("EQUATIONS - Multi Bot Lab Base Seed")
+    if !seedInfo.OK
+        return false
+
+    BotLabRunId := A_Now . "_" . A_TickCount
+    BotLabStatusDir := A_Temp . "\EquationsBotLab_" . BotLabRunId
+    DirCreate(BotLabStatusDir)
+
+    BotLabControllerConfig := Map(
+        "Workers", workers,
+        "PlayerCount", playerCount,
+        "Division", Division,
+        "BotTypes", botTypes,
+        "Shakes", shakes,
+        "Visibility", visibility,
+        "Delay", delay,
+        "BaseSeed", seedInfo.Value,
+        "StatusDir", BotLabStatusDir,
+        "RunId", BotLabRunId
+    )
+
+    BotLabWorkerPids := []
+    loop workers {
+        workerId := A_Index
+        seed := DeriveWorkerSeed(seedInfo.Value, workerId)
+        visible := (visibility = "ALL" || (visibility = "ONE" && workerId = 1))
+        pid := LaunchBotLabWorker(workerId, seed, visible, BotLabControllerConfig)
+        if !pid {
+            MsgBox("Worker " . workerId . " could not be launched. The workers that already started will remain running.", "Bot Lab launch failure")
+            break
+        }
+        BotLabWorkerPids.Push(pid)
+    }
+
+    if (BotLabWorkerPids.Length = 0)
+        return false
+
+    BuildBotLabControllerGui()
+    SetTimer(UpdateBotLabController, 500)
+    UpdateBotLabController()
+    return true
+}
+
+
+; ============================================================================
+; v4.7.2 PC PERFORMANCE BENCHMARK
+; ============================================================================
+
+SetupPcBenchmark() {
+    global BenchmarkConfig, BenchmarkStages, BenchmarkStageIndex, BenchmarkResults
+    global BenchmarkStopped, BenchmarkRootDir, Division
+
+    logical := DetectLogicalProcessorCount()
+    defaultMax := Max(1, Min(32, logical))
+
+    maxWorkers := PromptPositiveInteger(
+        "Maximum worker count to benchmark.`n`nDetected logical processors: " . logical
+        . "`n`nQuick mode tests representative counts up to this number. Full mode tests every count.",
+        "EQUATIONS - PC Benchmark",
+        defaultMax,
+        1,
+        32
+    )
+    if !maxWorkers
+        return false
+
+    profile := ""
+    loop {
+        p := InputBox(
+            "Benchmark detail:`n`nQ = QUICK (1, 2, 4, 8, 12, 16, 24, 32 as applicable)`nF = FULL (every worker count from 1 through the maximum)`n`nQuick is recommended first.",
+            "EQUATIONS - PC Benchmark",
+            "w540 h230",
+            "Q"
+        )
+        if (p.Result != "OK")
+            return false
+        v := StrLower(Trim(p.Value))
+        if (v = "q" || v = "quick") {
+            profile := "QUICK"
+            break
+        }
+        if (v = "f" || v = "full") {
+            profile := "FULL"
+            break
+        }
+        MsgBox("Enter Q or F.", "Invalid benchmark detail")
+    }
+
+    playerCount := PromptPlayerCount("EQUATIONS - Benchmark Players Per Game")
+    if !playerCount
+        return false
+    if !PromptDivision()
+        return false
+
+    botTypes := []
+    loop playerCount {
+        t := PromptPlayerType(A_Index, false, true, "EQUATIONS - Benchmark Bot Lineup")
+        if (t = "")
+            return false
+        botTypes.Push(t)
+    }
+
+    shakes := PromptPositiveInteger(
+        "How many shakes should EACH benchmark worker run in EACH stage?`n`n50 = quick comparison`n100 = better measurement`n500 = high-confidence benchmark",
+        "EQUATIONS - Benchmark Shakes Per Worker",
+        "100",
+        5,
+        100000
+    )
+    if !shakes
+        return false
+
+    seedInfo := PromptSeed("EQUATIONS - Benchmark Base Seed")
+    if !seedInfo.OK
+        return false
+
+    stages := BuildBenchmarkStages(maxWorkers, profile)
+    if (stages.Length = 0)
+        return false
+
+    runId := A_Now . "_" . A_TickCount
+    BenchmarkRootDir := A_Temp . "\EquationsBenchmark_" . runId
+    DirCreate(BenchmarkRootDir)
+
+    BenchmarkConfig := Map(
+        "MaxWorkers", maxWorkers,
+        "Profile", profile,
+        "PlayerCount", playerCount,
+        "Division", Division,
+        "BotTypes", botTypes,
+        "Shakes", shakes,
+        "Delay", 1,
+        "BaseSeed", seedInfo.Value,
+        "RunId", runId,
+        "LogicalProcessors", logical
+    )
+    BenchmarkStages := stages
+    BenchmarkStageIndex := 0
+    BenchmarkResults := []
+    BenchmarkStopped := false
+
+    BuildPcBenchmarkGui()
+    SetTimer(StartNextBenchmarkStage, -150)
+    return true
+}
+
+DetectLogicalProcessorCount() {
+    logical := 1
+    try {
+        t := EnvGet("NUMBER_OF_PROCESSORS")
+        if RegExMatch(t, "^\d+$")
+            logical := Max(1, t + 0)
+    }
+    return logical
+}
+
+BuildBenchmarkStages(maxWorkers, profile := "QUICK") {
+    stages := []
+    if (StrUpper(profile) = "FULL") {
+        loop maxWorkers
+            stages.Push(A_Index)
+        return stages
+    }
+
+    candidates := [1, 2, 4, 8, 12, 16, 24, 32]
+    seen := Map()
+    for _, count in candidates {
+        if (count <= maxWorkers && !seen.Has(count)) {
+            stages.Push(count)
+            seen[count] := true
+        }
+    }
+    if !seen.Has(maxWorkers)
+        stages.Push(maxWorkers)
+    return stages
+}
+
+BuildPcBenchmarkGui() {
+    global BenchmarkGui, BenchmarkEdit, BenchmarkStatusText, BenchmarkProgressBar
+
+    BenchmarkGui := Gui("", "EQUATIONS v4.9.2 - PC Benchmark")
+    BenchmarkGui.SetFont("s10", "Segoe UI")
+    BenchmarkGui.OnEvent("Close", PcBenchmarkClose)
+
+    title := BenchmarkGui.Add("Text", "x18 y14 w850 h28", "EQUATIONS PC PERFORMANCE BENCHMARK")
+    title.SetFont("s14 bold", "Segoe UI")
+    BenchmarkStatusText := BenchmarkGui.Add("Text", "x18 y48 w850 h42", "Preparing benchmark...")
+    BenchmarkProgressBar := BenchmarkGui.Add("Progress", "x18 y88 w850 h18 Range0-100", 0)
+    BenchmarkEdit := BenchmarkGui.Add("Edit", "x18 y116 w850 h414 ReadOnly VScroll HScroll -Wrap", "Starting...")
+
+    copyBtn := BenchmarkGui.Add("Button", "x18 y545 w150 h38", "Copy Results")
+    folderBtn := BenchmarkGui.Add("Button", "x183 y545 w170 h38", "Open Benchmark Folder")
+    stopBtn := BenchmarkGui.Add("Button", "x368 y545 w150 h38", "Stop Benchmark")
+    closeBtn := BenchmarkGui.Add("Button", "x718 y545 w150 h38", "Close")
+
+    copyBtn.OnEvent("Click", CopyPcBenchmarkResults)
+    folderBtn.OnEvent("Click", OpenPcBenchmarkFolder)
+    stopBtn.OnEvent("Click", StopPcBenchmarkButton)
+    closeBtn.OnEvent("Click", PcBenchmarkClose.Bind(BenchmarkGui))
+    BenchmarkGui.Show("w888 h602")
+    RefreshPcBenchmarkText()
+}
+
+StartNextBenchmarkStage(*) {
+    global BenchmarkStopped, BenchmarkStageIndex, BenchmarkStages, BenchmarkConfig
+    global BenchmarkWorkerPids, BenchmarkCurrentConfig, BenchmarkCurrentStartTick
+    global BenchmarkRootDir
+
+    if BenchmarkStopped
+        return
+
+    BenchmarkStageIndex += 1
+    if (BenchmarkStageIndex > BenchmarkStages.Length) {
+        FinalizePcBenchmark()
+        return
+    }
+
+    workers := BenchmarkStages[BenchmarkStageIndex]
+    cfg := BenchmarkConfig
+    stageDir := BenchmarkRootDir . "\stage_" . Format("{:02}", BenchmarkStageIndex) . "_" . workers . "w"
+    DirCreate(stageDir)
+
+    stageConfig := Map(
+        "Workers", workers,
+        "PlayerCount", cfg["PlayerCount"],
+        "Division", cfg["Division"],
+        "BotTypes", cfg["BotTypes"],
+        "Shakes", cfg["Shakes"],
+        "Visibility", "HIDDEN",
+        "Delay", 1,
+        "BaseSeed", cfg["BaseSeed"],
+        "StatusDir", stageDir,
+        "RunId", cfg["RunId"] . "_bench_" . workers . "w"
+    )
+
+    BenchmarkCurrentConfig := stageConfig
+    BenchmarkWorkerPids := []
+    BenchmarkCurrentStartTick := A_TickCount
+
+    loop workers {
+        workerId := A_Index
+        seed := DeriveWorkerSeed(cfg["BaseSeed"], workerId)
+        pid := LaunchBotLabWorker(workerId, seed, false, stageConfig)
+        if !pid
+            break
+        BenchmarkWorkerPids.Push(pid)
+    }
+
+    if (BenchmarkWorkerPids.Length != workers) {
+        StopBenchmarkCurrentWorkers()
+        RecordBenchmarkStageResult(workers, 0, 0, workers, 0, 0, "Could not launch all workers")
+        SetTimer(StartNextBenchmarkStage, -300)
+        return
+    }
+
+    RefreshPcBenchmarkText()
+    SetTimer(UpdatePcBenchmark, 100)
+    UpdatePcBenchmark()
+}
+
+UpdatePcBenchmark(*) {
+    global BenchmarkStopped, BenchmarkWorkerPids, BenchmarkCurrentConfig, BenchmarkCurrentStartTick
+    global BenchmarkProgressBar
+
+    if BenchmarkStopped
+        return
+    if (BenchmarkWorkerPids.Length = 0)
+        return
+
+    cfg := BenchmarkCurrentConfig
+    complete := 0
+    failed := 0
+    progress := 0
+    searchSuccess := 0
+    searchFailure := 0
+
+    loop BenchmarkWorkerPids.Length {
+        i := A_Index
+        pid := BenchmarkWorkerPids[i]
+        file := cfg["StatusDir"] . "\worker_" . i . ".ini"
+        state := "STARTING"
+        shake := 0
+        if FileExist(file) {
+            try state := IniRead(file, "Status", "State", "STARTING")
+            try shake := IniRead(file, "Status", "Shake", "0") + 0
+            try searchSuccess += IniRead(file, "Status", "SearchSuccesses", "0") + 0
+            try searchFailure += IniRead(file, "Status", "SearchFailures", "0") + 0
+            if (state != "COMPLETE" && state != "FAILED" && !ProcessExist(pid))
+                state := "STOPPED"
+        } else if !ProcessExist(pid) {
+            state := "EXITED"
+        }
+
+        progress += Min(shake, cfg["Shakes"])
+        if (state = "COMPLETE")
+            complete += 1
+        else if (state = "FAILED" || state = "STOPPED" || state = "EXITED")
+            failed += 1
+    }
+
+    total := cfg["Workers"] * cfg["Shakes"]
+    pct := total > 0 ? Floor((progress / total) * 100) : 0
+    if IsObject(BenchmarkProgressBar)
+        BenchmarkProgressBar.Value := Max(0, Min(100, pct))
+
+    elapsed := Max(0.001, (A_TickCount - BenchmarkCurrentStartTick) / 1000.0)
+    liveRate := progress / elapsed
+    RefreshPcBenchmarkText(complete, failed, progress, liveRate)
+
+    if (complete + failed >= BenchmarkWorkerPids.Length) {
+        SetTimer(UpdatePcBenchmark, 0)
+        RecordBenchmarkStageResult(cfg["Workers"], elapsed, complete, failed, searchSuccess, searchFailure)
+        if IsObject(BenchmarkProgressBar)
+            BenchmarkProgressBar.Value := 100
+        RefreshPcBenchmarkText()
+        SetTimer(StartNextBenchmarkStage, -300)
+    }
+}
+
+RecordBenchmarkStageResult(workers, elapsed, complete, failed, searchSuccess, searchFailure, detail := "") {
+    global BenchmarkResults, BenchmarkConfig
+    totalShakes := workers * BenchmarkConfig["Shakes"]
+    throughput := (elapsed > 0 && failed = 0) ? (totalShakes / elapsed) : 0
+    BenchmarkResults.Push({
+        Workers: workers,
+        Elapsed: elapsed,
+        Throughput: throughput,
+        Complete: complete,
+        Failed: failed,
+        SearchSuccesses: searchSuccess,
+        SearchFailures: searchFailure,
+        Detail: detail
+    })
+}
+
+RefreshPcBenchmarkText(currentComplete := -1, currentFailed := -1, currentProgress := -1, liveRate := 0) {
+    global BenchmarkConfig, BenchmarkStages, BenchmarkStageIndex, BenchmarkResults
+    global BenchmarkEdit, BenchmarkStatusText, BenchmarkSummary, BenchmarkStopped
+
+    if !IsObject(BenchmarkEdit)
+        return
+
+    cfg := BenchmarkConfig
+    botNames := []
+    for _, t in cfg["BotTypes"]
+        botNames.Push(t)
+
+    lines := []
+    lines.Push("Run ID: " . cfg["RunId"])
+    lines.Push("Logical processors reported by Windows: " . cfg["LogicalProcessors"])
+    lines.Push("Profile: " . cfg["Profile"] . " | Max workers: " . cfg["MaxWorkers"] . " | Shakes/worker/stage: " . cfg["Shakes"])
+    lines.Push("Division: " . cfg["Division"] . " | Players/game: " . cfg["PlayerCount"] . " | Hidden workers | Delay: 1 ms")
+    lines.Push("Lineup: " . JoinArray(botNames, " / "))
+    lines.Push("Base seed: " . cfg["BaseSeed"])
+    lines.Push("")
+    lines.Push("RESULTS")
+    lines.Push("Workers | Elapsed | Throughput | Search OK/Fail | Result")
+
+    bestWorkers := 0
+    bestRate := -1
+    for _, r in BenchmarkResults {
+        resultText := r.Failed = 0 ? "PASS" : "FAILED/STOPPED"
+        if (r.Detail != "")
+            resultText .= " - " . r.Detail
+        elapsedText := r.Elapsed > 0 ? Format("{:.2f}s", r.Elapsed) : "n/a"
+        rateText := r.Throughput > 0 ? Format("{:.2f} shakes/s", r.Throughput) : "n/a"
+        lines.Push(
+            r.Workers . " | " . elapsedText . " | " . rateText . " | "
+            . r.SearchSuccesses . "/" . r.SearchFailures . " | " . resultText
+        )
+        if (r.Failed = 0 && r.Throughput > bestRate) {
+            bestRate := r.Throughput
+            bestWorkers := r.Workers
+        }
+    }
+
+    stageTotal := BenchmarkStages.Length
+    if (!BenchmarkStopped && BenchmarkStageIndex >= 1 && BenchmarkStageIndex <= stageTotal && currentProgress >= 0) {
+        workers := BenchmarkStages[BenchmarkStageIndex]
+        total := workers * cfg["Shakes"]
+        lines.Push("")
+        lines.Push("CURRENT: " . workers . " workers | " . currentProgress . "/" . total . " shakes | " . Format("{:.2f}", liveRate) . " shakes/s live")
+        BenchmarkStatusText.Text := "Benchmark stage " . BenchmarkStageIndex . "/" . stageTotal . ": " . workers
+            . " workers   |   " . currentProgress . "/" . total . " shakes   |   " . Format("{:.2f}", liveRate) . " shakes/s"
+    } else if BenchmarkStopped {
+        BenchmarkStatusText.Text := "Benchmark stopped. Completed " . BenchmarkResults.Length . " stage(s)."
+    } else if (BenchmarkStageIndex > stageTotal) {
+        if (bestWorkers > 0)
+            BenchmarkStatusText.Text := "Benchmark complete. Best tested count: " . bestWorkers . " workers at " . Format("{:.2f}", bestRate) . " shakes/sec."
+        else
+            BenchmarkStatusText.Text := "Benchmark complete, but no stage completed cleanly."
+    } else {
+        BenchmarkStatusText.Text := "Preparing benchmark stage " . (BenchmarkStageIndex + 1) . "/" . stageTotal . "..."
+    }
+
+    if (bestWorkers > 0) {
+        lines.Push("")
+        lines.Push("BEST TESTED SO FAR: " . bestWorkers . " workers @ " . Format("{:.2f}", bestRate) . " shakes/sec")
+    }
+
+    BenchmarkSummary := JoinArray(lines, "`r`n")
+    BenchmarkEdit.Value := BenchmarkSummary
+}
+
+FinalizePcBenchmark() {
+    global BenchmarkStageIndex, BenchmarkStages, BenchmarkProgressBar
+    SetTimer(UpdatePcBenchmark, 0)
+    BenchmarkStageIndex := BenchmarkStages.Length + 1
+    if IsObject(BenchmarkProgressBar)
+        BenchmarkProgressBar.Value := 100
+    RefreshPcBenchmarkText()
+}
+
+CopyPcBenchmarkResults(*) {
+    global BenchmarkSummary
+    A_Clipboard := BenchmarkSummary
+    ClipWait(1)
+    MsgBox("PC benchmark results copied to the clipboard.", "EQUATIONS v4.9.2")
+}
+
+OpenPcBenchmarkFolder(*) {
+    global BenchmarkRootDir
+    if (BenchmarkRootDir != "" && DirExist(BenchmarkRootDir))
+        Run(QuoteCommandArg(BenchmarkRootDir))
+}
+
+StopBenchmarkCurrentWorkers() {
+    global BenchmarkWorkerPids
+    for _, pid in BenchmarkWorkerPids {
+        if ProcessExist(pid) {
+            try ProcessClose(pid)
+        }
+    }
+}
+
+StopPcBenchmarkButton(*) {
+    global BenchmarkStopped
+    answer := MsgBox("Stop the PC benchmark and all workers in the current stage?", "Stop PC Benchmark", "YesNo")
+    if (answer = "Yes") {
+        BenchmarkStopped := true
+        SetTimer(UpdatePcBenchmark, 0)
+        SetTimer(StartNextBenchmarkStage, 0)
+        StopBenchmarkCurrentWorkers()
+        RefreshPcBenchmarkText()
+    }
+}
+
+PcBenchmarkClose(guiObj, *) {
+    global BenchmarkWorkerPids, BenchmarkStopped
+
+    anyRunning := false
+    for _, pid in BenchmarkWorkerPids {
+        if ProcessExist(pid) {
+            anyRunning := true
             break
         }
     }
 
-    BotAutoRun := false
-    BotDelayMs := 650
-
-    if allBots {
+    if anyRunning {
         answer := MsgBox(
-            "Every seat is a bot.`n`nRun accelerated BOT LAB mode?`n`nYES = fast automated shakes with result dialogs suppressed.`nNO = normal visible tournament pacing.",
-            "EQUATIONS - Bot Lab",
-            "YesNo"
+            "Benchmark workers are still running.`n`nYES = stop them and close`nNO = close but leave current workers running`nCANCEL = keep benchmark open",
+            "Close PC Benchmark",
+            "YesNoCancel"
         )
+        if (answer = "Cancel")
+            return
+        if (answer = "Yes")
+            StopBenchmarkCurrentWorkers()
+    }
 
-        if (answer = "Yes") {
-            BotAutoRun := true
-            BotDelayMs := 30
+    BenchmarkStopped := true
+    SetTimer(UpdatePcBenchmark, 0)
+    SetTimer(StartNextBenchmarkStage, 0)
+    try guiObj.Destroy()
+    ExitApp()
+}
 
-            limitResult := InputBox(
-                "How many shakes should Bot Lab run before stopping?`n`nEnter 1-500.",
-                "EQUATIONS - Bot Lab Limit",
-                "w420 h175",
-                "20"
-            )
+LaunchBotLabWorker(workerId, seed, visible, config) {
+    botCodes := []
+    for _, t in config["BotTypes"]
+        botCodes.Push(BotTypeCode(t))
 
-            if (limitResult.Result = "OK" && RegExMatch(Trim(limitResult.Value), "^\d+$")) {
-                requested := Trim(limitResult.Value) + 0
-                BotAutoRunMaxShakes := Max(1, Min(500, requested))
+    args := []
+    args.Push("--worker")
+    args.Push("--worker-id=" . workerId)
+    args.Push("--run-id=" . config["RunId"])
+    args.Push("--status-dir=" . config["StatusDir"])
+    args.Push("--division=" . config["Division"])
+    args.Push("--player-count=" . config["PlayerCount"])
+    args.Push("--bot-codes=" . JoinArray(botCodes, ","))
+    args.Push("--shakes=" . config["Shakes"])
+    args.Push("--delay=" . config["Delay"])
+    args.Push("--seed=" . seed)
+    args.Push("--visible=" . (visible ? 1 : 0))
+
+    argText := ""
+    for _, arg in args
+        argText .= " " . QuoteCommandArg(arg)
+
+    if A_IsCompiled
+        command := QuoteCommandArg(A_ScriptFullPath) . argText
+    else
+        command := QuoteCommandArg(A_AhkPath) . " " . QuoteCommandArg(A_ScriptFullPath) . argText
+
+    pid := 0
+    options := visible ? "" : "Hide"
+    try Run(command, A_ScriptDir, options, &pid)
+    catch
+        return 0
+    return pid
+}
+
+BotTypeCode(playerType) {
+    if (playerType = "Practice Bot")
+        return "P"
+    if (playerType = "Very Hard Bot")
+        return "V"
+    if (playerType = "Rules Fuzzer")
+        return "R"
+    if (playerType = "Parser Fuzzer")
+        return "F"
+    if (playerType = "Chaos Fuzzer")
+        return "C"
+    if (playerType = "Random Bot")
+        return "X"
+    return "V"
+}
+
+BotTypeFromCode(code) {
+    c := StrUpper(Trim(code))
+    if (c = "X") {
+        choices := ["Practice Bot", "Very Hard Bot", "Rules Fuzzer", "Parser Fuzzer", "Chaos Fuzzer"]
+        return choices[EqRandom(1, choices.Length)]
+    }
+    t := NormalizePlayerType(c)
+    if (t = "" || t = "Human")
+        return "Very Hard Bot"
+    return t
+}
+
+ParseLaunchArgs() {
+    out := Map()
+    for _, arg in A_Args {
+        if (SubStr(arg, 1, 2) != "--")
+            continue
+        body := SubStr(arg, 3)
+        pos := InStr(body, "=")
+        if pos {
+            key := StrLower(SubStr(body, 1, pos - 1))
+            value := SubStr(body, pos + 1)
+            out[key] := value
+        } else {
+            out[StrLower(body)] := "1"
+        }
+    }
+    return out
+}
+
+ArgValue(args, key, defaultValue := "") {
+    key := StrLower(key)
+    return args.Has(key) ? args[key] : defaultValue
+}
+
+SetupBotLabWorker(args) {
+    global BotLabWorker, BotLabWorkerId, BotLabWorkerVisible, BotLabRunId, BotLabStatusDir, BotLabStatusFile
+    global BotLabMoveLogFile, BotLabMoveBuffer, BotLabMoveSequence
+    global PlayerCount, Players, PlayerTypes, Division, BotAutoRun, BotAutoRunMaxShakes, BotDelayMs
+    global RenderEnabled, AppMode
+
+    BotLabWorker := true
+    A_IconHidden := true
+    AppMode := "MultiBotLabWorker"
+    BotLabWorkerId := ArgValue(args, "worker-id", "1") + 0
+    BotLabRunId := ArgValue(args, "run-id", "worker")
+    BotLabStatusDir := ArgValue(args, "status-dir", A_Temp)
+    BotLabStatusFile := BotLabStatusDir . "\worker_" . BotLabWorkerId . ".ini"
+    BotLabMoveLogFile := BotLabStatusDir . "\worker_" . BotLabWorkerId . "_moves.txt"
+    BotLabMoveBuffer := []
+    BotLabMoveSequence := 0
+    try FileDelete(BotLabMoveLogFile)
+    OnExit(FlushBotMoveLog)
+    BotLabWorkerVisible := (ArgValue(args, "visible", "0") + 0) != 0
+    RenderEnabled := BotLabWorkerVisible
+
+    Division := ArgValue(args, "division", "Middle")
+    PlayerCount := ArgValue(args, "player-count", "3") + 0
+    if (PlayerCount != 2 && PlayerCount != 3)
+        return false
+
+    shakes := ArgValue(args, "shakes", "1000") + 0
+    BotAutoRunMaxShakes := Max(1, Min(1000000, shakes))
+    BotDelayMs := Max(1, Min(5000, ArgValue(args, "delay", "1") + 0))
+    BotAutoRun := true
+
+    seed := ArgValue(args, "seed", "1") + 0
+    SetSessionSeed(seed)
+
+    codes := StrSplit(ArgValue(args, "bot-codes", "V,V,V"), ",")
+    Players := []
+    PlayerTypes := []
+    loop PlayerCount {
+        code := (A_Index <= codes.Length) ? codes[A_Index] : "V"
+        playerType := BotTypeFromCode(code)
+        PlayerTypes.Push(playerType)
+        Players.Push(BotTypeLabel(playerType) . " " . A_Index)
+    }
+
+    InitializePlayerScores()
+    try DirCreate(BotLabStatusDir)
+    WriteBotLabWorkerStatus("STARTING")
+    return true
+}
+
+QuoteCommandArg(value) {
+    return Chr(34) . StrReplace(value, Chr(34), Chr(34) . Chr(34)) . Chr(34)
+}
+
+DeriveWorkerSeed(baseSeed, workerId) {
+    value := Mod((baseSeed + 0) + ((workerId - 1) * 1000003), 2147483646)
+    if (value <= 0)
+        value += 2147483646
+    return Floor(value)
+}
+
+GenerateRandomSeed() {
+    return Random(1, 2147483646)
+}
+
+SetSessionSeed(seed) {
+    global SeededRandomEnabled, SeedState, SessionSeed
+    normalized := Mod(Floor(Abs(seed + 0)), 2147483646)
+    if (normalized <= 0)
+        normalized := 1
+    SessionSeed := normalized
+    SeedState := normalized
+    SeededRandomEnabled := true
+}
+
+EqRandom(minValue, maxValue) {
+    global SeededRandomEnabled, SeedState
+
+    if !SeededRandomEnabled
+        return Random(minValue, maxValue)
+
+    if (maxValue < minValue) {
+        tmp := minValue
+        minValue := maxValue
+        maxValue := tmp
+    }
+
+    ; Park-Miller minimal-standard generator. The largest intermediate value is
+    ; safely inside AutoHotkey's signed 64-bit integer range.
+    SeedState := Mod(SeedState * 48271, 2147483647)
+    if (SeedState <= 0)
+        SeedState := 1
+    fraction := SeedState / 2147483647.0
+
+    if (Type(minValue) = "Integer" && Type(maxValue) = "Integer") {
+        span := maxValue - minValue + 1
+        value := minValue + Floor(fraction * span)
+        return Min(maxValue, value)
+    }
+
+    return minValue + (fraction * (maxValue - minValue))
+}
+
+; v4.8 hot-path integer RNG. Solver/shuffle callers always pass integer bounds,
+; so avoid the Type() checks in EqRandom while preserving the same Park-Miller
+; state transition and integer mapping.
+EqRandomInt(minValue, maxValue) {
+    global SeededRandomEnabled, SeedState
+
+    if !SeededRandomEnabled
+        return Random(minValue, maxValue)
+
+    if (maxValue < minValue) {
+        tmp := minValue
+        minValue := maxValue
+        maxValue := tmp
+    }
+
+    SeedState := Mod(SeedState * 48271, 2147483647)
+    if (SeedState <= 0)
+        SeedState := 1
+
+    span := maxValue - minValue + 1
+    value := minValue + Floor((SeedState / 2147483647.0) * span)
+    return Min(maxValue, value)
+}
+
+EqSoundBeep(frequency := 523, duration := 150) {
+    global BotLabWorker
+    if BotLabWorker
+        return
+    SoundBeep(frequency, duration)
+}
+
+ShowGameWindow() {
+    global MainGui, BotLabWorker, BotLabWorkerId, RenderEnabled
+    if !RenderEnabled
+        return
+
+    opts := "w1320 h900"
+    if BotLabWorker {
+        offset := Mod(BotLabWorkerId - 1, 8) * 26
+        opts := "x" . (20 + offset) . " y" . (20 + offset) . " w1320 h900"
+    }
+    MainGui.Show(opts)
+}
+
+BuildBotLabControllerGui() {
+    global BotLabControllerGui, BotLabControllerEdit, BotLabControllerStatusText, BotLabControllerConfig
+
+    cfg := BotLabControllerConfig
+    BotLabControllerGui := Gui("", "EQUATIONS v4.9.2 - Multi-Instance Bot Lab")
+    BotLabControllerGui.SetFont("s10", "Segoe UI")
+    BotLabControllerGui.OnEvent("Close", BotLabControllerClose)
+
+    title := BotLabControllerGui.Add("Text", "x18 y14 w850 h28", "MULTI-INSTANCE BOT LAB")
+    title.SetFont("s14 bold", "Segoe UI")
+    BotLabControllerStatusText := BotLabControllerGui.Add("Text", "x18 y48 w850 h48", "Launching workers...")
+    BotLabControllerEdit := BotLabControllerGui.Add("Edit", "x18 y100 w850 h430 ReadOnly VScroll HScroll -Wrap", "Starting...")
+
+    copyBtn := BotLabControllerGui.Add("Button", "x18 y545 w135 h38", "Copy Summary")
+    movesBtn := BotLabControllerGui.Add("Button", "x163 y545 w170 h38", "Copy All Bot Moves")
+    folderBtn := BotLabControllerGui.Add("Button", "x343 y545 w155 h38", "Open Run Folder")
+    stopBtn := BotLabControllerGui.Add("Button", "x508 y545 w140 h38", "Stop Workers")
+    closeBtn := BotLabControllerGui.Add("Button", "x718 y545 w150 h38", "Close")
+
+    copyBtn.OnEvent("Click", CopyBotLabControllerSummary)
+    movesBtn.OnEvent("Click", CopyAllBotLabMoves)
+    folderBtn.OnEvent("Click", OpenBotLabRunFolder)
+    stopBtn.OnEvent("Click", StopBotLabWorkersButton)
+    closeBtn.OnEvent("Click", BotLabControllerClose.Bind(BotLabControllerGui))
+    BotLabControllerGui.Show("w888 h602")
+}
+
+UpdateBotLabController(*) {
+    global BotLabControllerConfig, BotLabWorkerPids, BotLabControllerEdit, BotLabControllerStatusText
+    global BotLabControllerSummary
+
+    if !IsObject(BotLabControllerEdit)
+        return
+
+    cfg := BotLabControllerConfig
+    lines := []
+    botNames := []
+    for _, t in cfg["BotTypes"]
+        botNames.Push(t)
+
+    lines.Push("Run ID: " . cfg["RunId"])
+    lines.Push("Base seed: " . cfg["BaseSeed"])
+    lines.Push("Workers: " . BotLabWorkerPids.Length . " | Players/game: " . cfg["PlayerCount"] . " | Shakes/worker: " . cfg["Shakes"])
+    lines.Push("Division: " . cfg["Division"] . " | Visibility: " . cfg["Visibility"] . " | Delay: " . cfg["Delay"] . " ms")
+    lines.Push("Requested lineup: " . JoinArray(botNames, " / "))
+    lines.Push("")
+
+    totalProgress := 0
+    completeCount := 0
+    failedCount := 0
+    runningCount := 0
+
+    loop BotLabWorkerPids.Length {
+        i := A_Index
+        pid := BotLabWorkerPids[i]
+        file := cfg["StatusDir"] . "\worker_" . i . ".ini"
+        state := "STARTING"
+        shake := 0
+        seed := DeriveWorkerSeed(cfg["BaseSeed"], i)
+        successes := 0
+        failures := 0
+        phase := ""
+        detail := ""
+        seats := ""
+
+        if FileExist(file) {
+            try state := IniRead(file, "Status", "State", "STARTING")
+            try shake := IniRead(file, "Status", "Shake", "0") + 0
+            try seed := IniRead(file, "Status", "Seed", seed) + 0
+            try successes := IniRead(file, "Status", "SearchSuccesses", "0") + 0
+            try failures := IniRead(file, "Status", "SearchFailures", "0") + 0
+            try phase := IniRead(file, "Status", "Phase", "")
+            try detail := IniRead(file, "Status", "Detail", "")
+            try seats := IniRead(file, "Status", "Seats", "")
+            if (state != "COMPLETE" && state != "FAILED" && !ProcessExist(pid)) {
+                state := "STOPPED"
+                detail := "Worker process is no longer running"
             }
+        } else if !ProcessExist(pid) {
+            state := "EXITED"
+            detail := "Process ended before writing a status file"
+        }
+
+        if (state = "COMPLETE")
+            completeCount += 1
+        else if (state = "FAILED" || state = "EXITED" || state = "STOPPED")
+            failedCount += 1
+        else
+            runningCount += 1
+
+        totalProgress += Min(shake, cfg["Shakes"])
+        line := "Worker " . i . " | " . state . " | shake " . shake . "/" . cfg["Shakes"] . " | seed " . seed
+        if (phase != "")
+            line .= " | " . phase
+        line .= " | search " . successes . "/" . failures
+        if (seats != "")
+            line .= " | " . seats
+        if (detail != "")
+            line .= " | " . detail
+        lines.Push(line)
+    }
+
+    maxProgress := BotLabWorkerPids.Length * cfg["Shakes"]
+    header := "Running: " . runningCount . "   Complete: " . completeCount . "   Failed/stopped: " . failedCount
+        . "   Aggregate shakes started/completed: " . totalProgress . "/" . maxProgress
+    BotLabControllerStatusText.Text := header
+
+    BotLabControllerSummary := header . "`r`n`r`n" . JoinArray(lines, "`r`n")
+    BotLabControllerEdit.Value := BotLabControllerSummary
+
+    if (completeCount + failedCount >= BotLabWorkerPids.Length)
+        SetTimer(UpdateBotLabController, 0)
+}
+
+CopyBotLabControllerSummary(*) {
+    global BotLabControllerSummary
+    A_Clipboard := BotLabControllerSummary
+    ClipWait(1)
+    MsgBox("Bot Lab controller summary copied to the clipboard.", "EQUATIONS v4.9.2")
+}
+
+
+CopyAllBotLabMoves(*) {
+    global BotLabControllerConfig, BotLabWorkerPids
+
+    cfg := BotLabControllerConfig
+    if !IsObject(cfg) || !cfg.Has("StatusDir")
+        return
+
+    totalBytes := 0
+    loop BotLabWorkerPids.Length {
+        path := cfg["StatusDir"] . "\worker_" . A_Index . "_moves.txt"
+        if FileExist(path) {
+            try totalBytes += FileGetSize(path)
         }
     }
 
-    return true
+    if (totalBytes > 25 * 1024 * 1024) {
+        answer := MsgBox(
+            "The combined bot-move logs are about " . Format("{:.1f}", totalBytes / 1048576.0)
+            . " MB.`n`nCopying that much text to the clipboard may take a moment. Continue?",
+            "Copy All Bot Moves",
+            "YesNo"
+        )
+        if (answer != "Yes")
+            return
+    }
+
+    blocks := []
+    blocks.Push("EQUATIONS v4.9.2 - ALL BOT MOVES")
+    blocks.Push("Run ID: " . cfg["RunId"])
+    blocks.Push("Base seed: " . cfg["BaseSeed"])
+    blocks.Push("Workers: " . BotLabWorkerPids.Length . " | Shakes/worker: " . cfg["Shakes"])
+    blocks.Push("")
+
+    loop BotLabWorkerPids.Length {
+        i := A_Index
+        statusPath := cfg["StatusDir"] . "\worker_" . i . ".ini"
+        movesPath := cfg["StatusDir"] . "\worker_" . i . "_moves.txt"
+        seed := DeriveWorkerSeed(cfg["BaseSeed"], i)
+        seats := ""
+        if FileExist(statusPath) {
+            try seed := IniRead(statusPath, "Status", "Seed", seed)
+            try seats := IniRead(statusPath, "Status", "Seats", "")
+        }
+
+        blocks.Push("============================================================")
+        blocks.Push("WORKER " . i . " | SEED " . seed . (seats != "" ? " | " . seats : ""))
+        blocks.Push("============================================================")
+        if FileExist(movesPath) {
+            try {
+                blocks.Push(RTrim(FileRead(movesPath, "UTF-8"), "`r`n"))
+            } catch {
+                blocks.Push("[Could not read move log]")
+            }
+        } else {
+            blocks.Push("[No flushed move log found. A running worker may still have recent moves buffered.]")
+        }
+        blocks.Push("")
+    }
+
+    A_Clipboard := JoinArray(blocks, "`r`n")
+    ClipWait(2)
+    MsgBox(
+        "Copied all available bot moves from " . BotLabWorkerPids.Length . " worker(s) to the clipboard.",
+        "EQUATIONS v4.9.2"
+    )
+}
+
+OpenBotLabRunFolder(*) {
+    global BotLabStatusDir
+    if (BotLabStatusDir != "" && DirExist(BotLabStatusDir))
+        Run(QuoteCommandArg(BotLabStatusDir))
+}
+
+StopBotLabWorkersButton(*) {
+    answer := MsgBox("Stop every currently running Bot Lab worker?", "Stop Bot Lab Workers", "YesNo")
+    if (answer = "Yes") {
+        StopAllBotLabWorkers()
+        UpdateBotLabController()
+    }
+}
+
+StopAllBotLabWorkers() {
+    global BotLabWorkerPids
+    for _, pid in BotLabWorkerPids {
+        if ProcessExist(pid) {
+            try ProcessClose(pid)
+        }
+    }
+}
+
+BotLabControllerClose(guiObj, *) {
+    global BotLabWorkerPids
+
+    anyRunning := false
+    for _, pid in BotLabWorkerPids {
+        if ProcessExist(pid) {
+            anyRunning := true
+            break
+        }
+    }
+
+    if anyRunning {
+        answer := MsgBox(
+            "Bot Lab workers are still running.`n`nYES = stop all workers and close`nNO = close the controller but leave workers running`nCANCEL = keep the controller open",
+            "Close Bot Lab Controller",
+            "YesNoCancel"
+        )
+        if (answer = "Cancel")
+            return
+        if (answer = "Yes")
+            StopAllBotLabWorkers()
+    }
+
+    SetTimer(UpdateBotLabController, 0)
+    try guiObj.Destroy()
+    ExitApp()
+}
+
+WriteBotLabWorkerStatus(state := "RUNNING", detail := "") {
+    global BotLabWorker, BotLabStatusFile, BotLabWorkerId, BotLabRunId, SessionSeed
+    global ShakeNumber, Phase, BotAutoRunMaxShakes, BotSearchSuccesses, BotSearchFailures, PlayerTypes
+
+    if !BotLabWorker || BotLabStatusFile = ""
+        return
+
+    temp := BotLabStatusFile . ".tmp"
+    try FileDelete(temp)
+
+    seats := []
+    for _, t in PlayerTypes
+        seats.Push(t)
+
+    try {
+        IniWrite(state, temp, "Status", "State")
+        IniWrite(detail, temp, "Status", "Detail")
+        IniWrite(BotLabRunId, temp, "Status", "RunId")
+        IniWrite(BotLabWorkerId, temp, "Status", "Worker")
+        IniWrite(ProcessExist(), temp, "Status", "PID")
+        IniWrite(SessionSeed, temp, "Status", "Seed")
+        IniWrite(ShakeNumber, temp, "Status", "Shake")
+        IniWrite(BotAutoRunMaxShakes, temp, "Status", "Limit")
+        IniWrite(Phase, temp, "Status", "Phase")
+        IniWrite(BotSearchSuccesses, temp, "Status", "SearchSuccesses")
+        IniWrite(BotSearchFailures, temp, "Status", "SearchFailures")
+        IniWrite(JoinArray(seats, "/"), temp, "Status", "Seats")
+        IniWrite(A_Now, temp, "Status", "Updated")
+
+        moved := false
+        loop 3 {
+            try {
+                FileMove(temp, BotLabStatusFile, 1)
+                moved := true
+                break
+            } catch {
+                Sleep(10)
+            }
+        }
+        if !moved {
+            try FileCopy(temp, BotLabStatusFile, 1)
+            try FileDelete(temp)
+        }
+    }
+}
+
+BotLabInvariantFailure() {
+    global BotLabWorker, Phase, Cubes, GoalOrder, ZoneOrder, PlayerCount, GoalSetter, CurrentPlayer
+
+    if !BotLabWorker || Phase = "Setup"
+        return ""
+
+    if (Cubes.Length != 24)
+        return "Expected 24 physical cubes, found " . Cubes.Length
+
+    validZones := Map("Resources", true, "Goal", true, "Required", true, "Permitted", true, "Forbidden", true)
+    for idx, cube in Cubes {
+        if !validZones.Has(cube.Zone)
+            return "Cube " . idx . " has invalid zone '" . cube.Zone . "'"
+    }
+
+    if (GoalSetter < 1 || GoalSetter > PlayerCount)
+        return "GoalSetter index out of range: " . GoalSetter
+    if (CurrentPlayer < 0 || CurrentPlayer > PlayerCount)
+        return "CurrentPlayer index out of range: " . CurrentPlayer
+    if (GoalOrder.Length > 6)
+        return "Goal contains more than six cubes"
+
+    seen := Map()
+    for _, idx in GoalOrder {
+        if (idx < 1 || idx > Cubes.Length)
+            return "GoalOrder contains invalid cube index " . idx
+        if seen.Has(idx)
+            return "Cube " . idx . " appears more than once in board ordering"
+        seen[idx] := true
+        if (Cubes[idx].Zone != "Goal")
+            return "GoalOrder cube " . idx . " is actually in " . Cubes[idx].Zone
+    }
+
+    if (CountZone("Goal") != GoalOrder.Length)
+        return "GoalOrder count does not match cubes physically in Goal"
+
+    for _, zone in ["Required", "Permitted", "Forbidden"] {
+        arr := ZoneOrder[zone]
+        if (CountZone(zone) != arr.Length)
+            return zone . " ordering count does not match physical cube zones"
+        for _, idx in arr {
+            if (idx < 1 || idx > Cubes.Length)
+                return zone . " contains invalid cube index " . idx
+            if seen.Has(idx)
+                return "Cube " . idx . " appears in more than one ordered zone"
+            seen[idx] := true
+            if (Cubes[idx].Zone != zone)
+                return zone . " ordering says cube " . idx . " but cube is in " . Cubes[idx].Zone
+        }
+    }
+
+    return ""
+}
+
+FailBotLabWorker(reason) {
+    global BotLabWorker, BotLabFailureDetected, BotLabFailureReason, BotLabStatusDir, BotLabWorkerId
+
+    if !BotLabWorker || BotLabFailureDetected
+        return
+
+    BotLabFailureDetected := true
+    BotLabFailureReason := reason
+    AddBotDiagnostic("BOT LAB FAILURE: " . reason)
+    FlushBotMoveLog()
+    WriteBotLabWorkerStatus("FAILED", reason)
+
+    reportPath := BotLabStatusDir . "\worker_" . BotLabWorkerId . "_FAILURE.txt"
+    try {
+        FileDelete(reportPath)
+        FileAppend(BuildBotDiagnosticsText() . "`r`n`r`nFAILURE: " . reason, reportPath, "UTF-8")
+    }
+    ExitApp()
 }
 
 ; ============================================================================
@@ -533,9 +1953,18 @@ BotControllerTick(*) {
     global BotThinking, Phase, GoalSetter, CurrentPlayer, LastMover
     global BotActionSerial, BotChallengeCheckedSerial
     global BotAutoRun, BotAutoRunMaxShakes, BotAutoRunFinished, ShakeNumber
+    global BotLabWorker
 
     if BotThinking
         return
+
+    if BotLabWorker {
+        invariantProblem := BotLabInvariantFailure()
+        if (invariantProblem != "") {
+            FailBotLabWorker(invariantProblem)
+            return
+        }
+    }
 
     BotThinking := true
     try {
@@ -570,11 +1999,17 @@ BotControllerTick(*) {
                 if !BotAutoRunFinished {
                     BotAutoRunFinished := true
                     AddLog("BOT LAB reached its requested " . BotAutoRunMaxShakes . " shake limit.")
-                    MsgBox(
-                        "BOT LAB completed " . BotAutoRunMaxShakes . " automated shakes.`n`n"
-                        . "Open History or press Ctrl+Shift+B for diagnostics. The match is paused between shakes so you can inspect it.",
-                        "EQUATIONS - Bot Lab complete"
-                    )
+                    if BotLabWorker {
+                        FlushBotMoveLog()
+                        WriteBotLabWorkerStatus("COMPLETE", "Requested shake limit reached")
+                        ExitApp()
+                    } else {
+                        MsgBox(
+                            "BOT LAB completed " . BotAutoRunMaxShakes . " automated shakes.`n`n"
+                            . "Open History or press Ctrl+Shift+B for diagnostics. The match is paused between shakes so you can inspect it.",
+                            "EQUATIONS - Bot Lab complete"
+                        )
+                    }
                 }
                 return
             }
@@ -611,7 +2046,12 @@ BotTakeGoalTurn(player) {
         return
     }
 
-    AddBotDiagnostic(PlayerName(player) . " sets candidate Goal " . candidate.Expr . " using " . candidate.Indices.Length . " cube(s).")
+    goalDetail := ""
+    if (PlayerTypeName(player) = "Very Hard Bot" && candidate.HasOwnProp("StrategicScore")) {
+        goalDetail := " [strategy " . candidate.StrategicScore
+            . "; solution witness " . candidate.WitnessCubes . " cube(s)]"
+    }
+    AddBotDiagnostic(PlayerName(player) . " sets candidate Goal " . candidate.Expr . " using " . candidate.Indices.Length . " cube(s)." . goalDetail)
 
     for _, idx in candidate.Indices {
         if (Phase != "GoalSetting")
@@ -636,7 +2076,7 @@ BotChooseGoalCandidate(player) {
     ; Chaos occasionally creates an intentionally illegal Goal when the exact
     ; physical faces exist. This is useful for exercising v4.4's automatic
     ; immediate-IMPOSSIBLE illegal-Goal adjudication.
-    if (playerType = "Chaos Fuzzer" && Random(1, 100) <= 18) {
+    if (playerType = "Chaos Fuzzer" && EqRandom(1, 100) <= 18) {
         bad := BotGoalFromFacePattern(["8", "/", "0"])
         if bad.OK {
             bad.Expr := "8/0"
@@ -689,14 +2129,14 @@ BotChooseGoalCandidate(player) {
         maxCubes := 6
         candidateTrials := 80
         solutionTrials := 80
-        requireSolvable := (Random(1, 100) <= 70)
+        requireSolvable := (EqRandom(1, 100) <= 70)
     }
 
     best := {OK: false}
     bestScore := -1000000
 
     loop candidateTrials {
-        count := Random(minCubes, Min(maxCubes, resources.Length))
+        count := EqRandom(minCubes, Min(maxCubes, resources.Length))
         picked := BotRandomDistinct(resources, count)
         candidate := BotBuildGoalCandidate(picked)
         if !candidate.OK
@@ -713,17 +2153,21 @@ BotChooseGoalCandidate(player) {
         if solvable
             score += 20
 
-        ; Practice prefers smaller/easier Goals. Hard/fuzzers prefer more structure.
+        ; Practice prefers smaller/easier Goals. v4.9.2 Very Hard prefers a Goal
+        ; with a proven Solution witness that is not trivially short. Fuzzers
+        ; retain their previous structure/edge-case preferences.
         if (playerType = "Practice Bot")
             score := 40 - (candidate.Indices.Length * 6) + (solvable ? 10 : 0)
-        else if (playerType = "Very Hard Bot")
-            score += BotGoalComplexity(candidate.Expr)
-        else if (playerType = "Rules Fuzzer")
+        else if (playerType = "Very Hard Bot") {
+            score := BotHardGoalStrategicScore(candidate, solution)
+            candidate.StrategicScore := score
+            candidate.WitnessCubes := solution.OK ? solution.Indices.Length : 0
+        } else if (playerType = "Rules Fuzzer")
             score += candidate.Indices.Length * 3
         else if (playerType = "Parser Fuzzer")
             score += (InStr(candidate.Expr, "sqrt") || InStr(candidate.Expr, "^")) ? 12 : 0
         else if (playerType = "Chaos Fuzzer")
-            score += Random(-15, 15)
+            score += EqRandom(-15, 15)
 
         if (score > bestScore) {
             best := candidate
@@ -850,6 +2294,37 @@ BotGoalComplexity(expr) {
     return score
 }
 
+BotHardGoalStrategicScore(candidate, solution) {
+    ; This is deliberately a heuristic, not a rules judgment. A candidate must
+    ; already have a referee-valid Goal and a bounded-search Solution witness.
+    if !solution.OK
+        return -1000000
+
+    witnessCubes := solution.Indices.Length
+    score := 34
+
+    ; Longer witnessed Solutions are generally less immediately obvious than a
+    ; two-cube identity, while still proving that the Goal is playable.
+    score += Min(witnessCubes, 8) * 6
+    if (witnessCubes <= 3)
+        score -= 14
+    else if (witnessCubes >= 6)
+        score += 8
+
+    ; Some structure is useful, but do not let decorative complexity dominate
+    ; the fact that the Goal must have a real Solution.
+    score += candidate.Indices.Length * 3
+    score += Min(BotGoalComplexity(candidate.Expr), 22)
+
+    ; 0 and +/-1 routinely admit many short identities in Basic EQUATIONS, so
+    ; de-emphasize them without banning them. They remain available when the roll
+    ; offers no stronger referee-valid candidate.
+    if (NearlyZero(candidate.Value) || NearlyEqual(Abs(candidate.Value), 1))
+        score -= 18
+
+    return score
+}
+
 BotTakePlayTurn(player) {
     global Phase, CurrentPlayer, SelectedCube, Cubes, BonusUsedThisTurn
 
@@ -861,24 +2336,39 @@ BotTakePlayTurn(player) {
     if (resources.Length = 0)
         return
 
-    ; Some bots exercise BONUS, but only through the existing legal BONUS path.
+    ; v4.9.2: Very Hard uses a selective tactical BONUS instead of a flat percentage. It uses a
+    ; bounded tactical probe and only takes a BONUS when it can already exhibit
+    ; an IMPOSSIBLE-defense Equation and does not expose a NOW witness after the
+    ; BONUS move itself. Other bot personalities retain their old behavior.
     if (!BonusUsedThisTurn && ResourceCount() > 1 && CanBonus(player)) {
-        bonusChance := 0
-        if (playerType = "Practice Bot")
-            bonusChance := 8
-        else if (playerType = "Very Hard Bot")
-            bonusChance := 16
-        else if (playerType = "Rules Fuzzer")
-            bonusChance := 45
-        else if (playerType = "Parser Fuzzer")
-            bonusChance := 12
-        else if (playerType = "Chaos Fuzzer")
-            bonusChance := 30
+        if (playerType = "Very Hard Bot") {
+            bonus := BotChooseHardBonus(player)
+            if bonus.OK {
+                SelectedCube := bonus.Index
+                AddBotDiagnostic(
+                    PlayerName(player) . " chooses strategic BONUS " . CubeCode(Cubes[SelectedCube])
+                    . " -> Forbidden. [strategy " . bonus.Score . "; NOW probe clear; IMPOSSIBLE defense witness]"
+                )
+                BonusSelected()
+                return
+            }
+        } else {
+            bonusChance := 0
+            if (playerType = "Practice Bot")
+                bonusChance := 8
+            else if (playerType = "Rules Fuzzer")
+                bonusChance := 45
+            else if (playerType = "Parser Fuzzer")
+                bonusChance := 12
+            else if (playerType = "Chaos Fuzzer")
+                bonusChance := 30
 
-        if (Random(1, 100) <= bonusChance) {
-            SelectedCube := resources[Random(1, resources.Length)]
-            BonusSelected()
-            return
+            if (EqRandom(1, 100) <= bonusChance) {
+                SelectedCube := resources[EqRandom(1, resources.Length)]
+                AddBotDiagnostic(PlayerName(player) . " chooses BONUS " . CubeCode(Cubes[SelectedCube]) . " -> Forbidden.")
+                BonusSelected()
+                return
+            }
         }
     }
 
@@ -887,7 +2377,13 @@ BotTakePlayTurn(player) {
         return
 
     SelectedCube := move.Index
-    AddBotDiagnostic(PlayerName(player) . " chooses " . CubeCode(Cubes[move.Index]) . " -> " . move.Zone . ".")
+    detail := ""
+    if (playerType = "Very Hard Bot" && move.HasOwnProp("StrategyScore")) {
+        detail := " [strategy " . move.StrategyScore
+            . "; NOW probe " . (move.NowThreat ? "THREAT" : "clear")
+            . "; IMPOSSIBLE defense " . (move.DefenseFound ? "witness" : "not found") . "]"
+    }
+    AddBotDiagnostic(PlayerName(player) . " chooses " . CubeCode(Cubes[move.Index]) . " -> " . move.Zone . "." . detail)
     PlaceSelected(move.Zone)
 }
 
@@ -899,14 +2395,14 @@ BotChooseOrdinaryMove(player) {
     if (resources.Length = 0)
         return {OK: false}
 
-    idx := resources[Random(1, resources.Length)]
+    idx := resources[EqRandom(1, resources.Length)]
 
     if (resources.Length = 1) {
-        zone := (Random(1, 100) <= 55) ? "Required" : "Permitted"
+        zone := (EqRandom(1, 100) <= 55) ? "Required" : "Permitted"
         return {OK: true, Index: idx, Zone: zone}
     }
 
-    roll := Random(1, 100)
+    roll := EqRandom(1, 100)
     if (playerType = "Practice Bot") {
         zone := (roll <= 38) ? "Required" : (roll <= 78 ? "Permitted" : "Forbidden")
     } else if (playerType = "Rules Fuzzer") {
@@ -922,57 +2418,548 @@ BotChooseOrdinaryMove(player) {
     return {OK: true, Index: idx, Zone: zone}
 }
 
-BotChooseHardMove(player) {
+BotChooseHardMove(player, sampleLimit := 7, quick := false) {
     global Cubes
 
     resources := BotIndicesInZone("Resources")
     if (resources.Length = 0)
         return {OK: false}
 
+    ; Last cube has only two legal destinations. Keep the real FORCEOUT witness
+    ; probe because this decision directly controls the writing position.
     if (resources.Length = 1)
-        return {OK: true, Index: resources[1], Zone: "Required"}
+        return BotChooseHardLastCubeMove(player, resources[1], quick)
 
-    sampleCount := Min(resources.Length, 8)
+    ; v4.9.2 strategy pipeline:
+    ;   1) score sampled cube/destination pairs structurally with NO equation search,
+    ;   2) preserve Required/Permitted/Forbidden diversity,
+    ;   3) use only a tiny NOW screen on the shortlist,
+    ;   4) spend the meaningful NOW/IMPOSSIBLE search budget on the best two.
+    ;
+    ; The expensive referee-backed solver is therefore still deciding close tactical
+    ; positions; it simply is not asked the same expensive question for every mediocre
+    ; candidate on the board.
+    sampleCount := Min(resources.Length, sampleLimit)
     sample := BotRandomDistinct(resources, sampleCount)
-    best := {OK: false}
-    bestScore := -1000000
+    cheapCandidates := []
 
     for _, idx in sample {
         for _, zone in ["Required", "Permitted", "Forbidden"] {
-            if (resources.Length = 1 && zone = "Forbidden")
+            cheapCandidates.Push({
+                Index: idx,
+                Zone: zone,
+                Score: BotHardCheapMoveScore(player, idx, zone)
+            })
+        }
+    }
+
+    shortlistCount := quick ? 3 : 4
+    shortlist := BotHardBuildDiverseShortlist(cheapCandidates, shortlistCount)
+    tacticallyScored := []
+
+    ; First pass is NOW-only. A found threat is hard evidence and gets the normal
+    ; large tactical penalty. Defense searching is intentionally deferred to the
+    ; finalists, because doing it on every candidate was mostly failed work.
+    for _, candidate in shortlist {
+        eval := BotHardEvaluateMove(
+            player,
+            candidate.Index,
+            candidate.Zone,
+            quick ? 2 : 3,
+            0,
+            candidate.Score
+        )
+        if !eval.OK
+            continue
+
+        tacticallyScored.Push({
+            Index: candidate.Index,
+            Zone: candidate.Zone,
+            BaseScore: candidate.Score,
+            Score: eval.Score,
+            NowThreat: eval.NowThreat,
+            DefenseFound: false
+        })
+    }
+
+    if (tacticallyScored.Length = 0)
+        return BotChooseOrdinaryMove(player)
+
+    finalists := BotHardTakeTopCandidates(tacticallyScored, quick ? 1 : 2)
+    best := {OK: false}
+    bestScore := -1000000
+
+    for _, candidate in finalists {
+        if quick {
+            finalEval := {
+                OK: true,
+                Score: candidate.Score,
+                NowThreat: candidate.NowThreat,
+                DefenseFound: false
+            }
+        } else {
+            ; Only the best two positions pay for real tactical confirmation.
+            ; Positive NOW evidence from the first pass remains sticky.
+            deep := BotHardEvaluateMove(
+                player,
+                candidate.Index,
+                candidate.Zone,
+                8,
+                10,
+                candidate.BaseScore
+            )
+            if !deep.OK
                 continue
 
-            oldZone := Cubes[idx].Zone
-            Cubes[idx].Zone := zone
-            probe := BotFindBoardEquation("IMPOSSIBLE", 65)
-            Cubes[idx].Zone := oldZone
+            combinedThreat := candidate.NowThreat || deep.NowThreat
+            finalScore := BotHardComposeMoveScore(
+                player,
+                candidate.Index,
+                candidate.Zone,
+                candidate.BaseScore,
+                combinedThreat,
+                deep.DefenseFound,
+                ResourceCount() - 1
+            )
+            finalEval := {
+                OK: true,
+                Score: finalScore,
+                NowThreat: combinedThreat,
+                DefenseFound: deep.DefenseFound
+            }
+        }
 
-            score := probe.Submitted ? 20 : -35
-            if (zone = "Required")
-                score += 8
-            else if (zone = "Forbidden")
-                score += 6
-            else
-                score += 2
-
-            face := Cubes[idx].Face
-            if (zone = "Forbidden" && (face = "sqrt" || face = "^" || face = "/"))
-                score += 4
-            if (zone = "Required" && IsDigitFace(face))
-                score += 2
-
-            score += Random(-2, 2)
-
-            if (score > bestScore) {
-                bestScore := score
-                best := {OK: true, Index: idx, Zone: zone}
+        if (finalEval.Score > bestScore) {
+            bestScore := finalEval.Score
+            best := {
+                OK: true,
+                Index: candidate.Index,
+                Zone: candidate.Zone,
+                StrategyScore: finalEval.Score,
+                NowThreat: finalEval.NowThreat,
+                DefenseFound: finalEval.DefenseFound
             }
         }
     }
 
-    if best.OK
+    return best.OK ? best : BotChooseOrdinaryMove(player)
+}
+
+BotHardBuildDiverseShortlist(candidates, limit) {
+    result := []
+    selected := Map()
+
+    ; Preserve strategic diversity: the tactical stage gets at least the best
+    ; Required, Permitted, and Forbidden candidate when the shortlist is large
+    ; enough, then fills remaining slots by overall cheap score.
+    for _, zone in ["Required", "Permitted", "Forbidden"] {
+        if (result.Length >= limit)
+            break
+
+        best := {Found: false}
+        for _, candidate in candidates {
+            if (candidate.Zone != zone)
+                continue
+            if (!best.Found || candidate.Score > best.Score)
+                best := {Found: true, Candidate: candidate, Score: candidate.Score}
+        }
+
+        if best.Found {
+            key := best.Candidate.Index . "|" . best.Candidate.Zone
+            if !selected.Has(key) {
+                selected[key] := true
+                result.Push(best.Candidate)
+            }
+        }
+    }
+
+    ranked := BotHardTakeTopCandidates(candidates, candidates.Length)
+    for _, candidate in ranked {
+        if (result.Length >= limit)
+            break
+        key := candidate.Index . "|" . candidate.Zone
+        if selected.Has(key)
+            continue
+        selected[key] := true
+        result.Push(candidate)
+    }
+
+    return result
+}
+
+BotHardTakeTopCandidates(candidates, limit) {
+    result := []
+    used := Map()
+    count := Min(limit, candidates.Length)
+
+    loop count {
+        bestIndex := 0
+        bestScore := -1000000000
+
+        for i, candidate in candidates {
+            if used.Has(i)
+                continue
+            if (bestIndex = 0 || candidate.Score > bestScore) {
+                bestIndex := i
+                bestScore := candidate.Score
+            }
+        }
+
+        if (bestIndex = 0)
+            break
+
+        used[bestIndex] := true
+        result.Push(candidates[bestIndex])
+    }
+
+    return result
+}
+
+BotHardCheapMoveScore(player, idx, zone) {
+    global Cubes
+
+    face := Cubes[idx].Face
+    requiredCount := CountZone("Required")
+    permittedCount := CountZone("Permitted")
+    forbiddenCount := CountZone("Forbidden")
+    distinctForbidden := BotHardForbiddenDistinctCount()
+    gap := BotHardScoreGap(player)
+    alreadyForbidden := BotHardFaceIsInZone(face, "Forbidden")
+    alreadyRequired := BotHardFaceIsInZone(face, "Required")
+    requiredFaceCount := BotHardFaceCountInZone(face, "Required")
+
+    score := 0
+
+    if (zone = "Required") {
+        ; Required is a powerful constraint, not a generic "good" destination.
+        ; v4.9.1 started digits around 14-15 points and therefore stacked long
+        ; Required runs before considering anything else. Start close to Permitted
+        ; and sharply reduce the value of each additional mandatory cube.
+        score += 7
+        score += IsDigitFace(face) ? 3 : 2
+
+        if alreadyForbidden
+            score -= 18
+
+        ; Requiring another copy of a face that is already mandatory is a much
+        ; stronger restriction than introducing a new ingredient.
+        if (requiredFaceCount > 0)
+            score -= requiredFaceCount * 4
+
+        ; Three Required cubes are already a meaningful equation skeleton. Past
+        ; that point, flexibility becomes strategically valuable very quickly.
+        if (requiredCount >= 3)
+            score -= (requiredCount - 2) * 2
+        if (requiredCount >= 6)
+            score -= (requiredCount - 5) * 2
+
+        ; Long digit-only Required piles were a common v4.9.1 failure pattern.
+        if (IsDigitFace(face) && requiredCount >= 4)
+            score -= 2
+
+        ; If Required is already dominating the optional pool, stop feeding it.
+        if (requiredCount >= permittedCount + 4)
+            score -= 3
+    } else if (zone = "Permitted") {
+        ; Permitted preserves options for both tactical NOW play and final writing.
+        ; It should become increasingly attractive as mandatory constraints pile up.
+        score += 8
+        if alreadyForbidden
+            score -= 12
+        if (requiredCount >= 3)
+            score += Min(requiredCount - 2, 4)
+        if (forbiddenCount >= 4)
+            score += 2
+        if (ResourceCount() <= 6)
+            score += 2
+        if (permittedCount >= 9)
+            score -= (permittedCount - 8)
+    } else {
+        ; Denial remains a real strategic option, but repeated/saturated Forbidden
+        ; faces are penalized so it competes with Required and Permitted rather than
+        ; replacing them.
+        score += 3 + BotHardFaceDenialValue(face)
+        score -= BotHardForbiddenPressurePenalty(
+            distinctForbidden,
+            forbiddenCount,
+            alreadyForbidden,
+            gap
+        )
+        if alreadyRequired
+            score -= 14
+        if IsDigitFace(face)
+            score -= 2
+        if (gap > 0)
+            score += Min(gap, 4)
+    }
+
+    ; Tiny seeded tie-break only. It cannot overwhelm the structural score.
+    score += EqRandomInt(-1, 1)
+    return score
+}
+
+BotHardEvaluateMove(player, idx, zone, nowTrials := 8, defenseTrials := 12, baseScore := "") {
+    global Cubes
+
+    if (idx < 1 || idx > Cubes.Length || Cubes[idx].Zone != "Resources")
+        return {OK: false}
+
+    if (baseScore = "")
+        baseScore := BotHardCheapMoveScore(player, idx, zone)
+
+    oldZone := Cubes[idx].Zone
+    Cubes[idx].Zone := zone
+
+    try {
+        remaining := ResourceCount()
+        nowLegal := (remaining >= 2 && (CountZone("Required") + CountZone("Permitted") > 0))
+        nowThreat := false
+        defenseFound := false
+
+        if (nowLegal && nowTrials > 0)
+            nowThreat := BotFindBoardEquation("NOW", nowTrials).Submitted
+
+        if (defenseTrials > 0)
+            defenseFound := BotFindBoardEquation("IMPOSSIBLE", defenseTrials).Submitted
+
+        return {
+            OK: true,
+            Score: BotHardComposeMoveScore(player, idx, zone, baseScore, nowThreat, defenseFound, remaining),
+            NowThreat: nowThreat,
+            DefenseFound: defenseFound
+        }
+    } finally {
+        Cubes[idx].Zone := oldZone
+    }
+}
+
+BotHardComposeMoveScore(player, idx, zone, baseScore, nowThreat, defenseFound, remainingAfterMove) {
+    ; A found NOW Equation is hard positive evidence that the candidate is bad.
+    ; A failed NOW probe is only weak evidence. Likewise, a found defense witness
+    ; is valuable, while failure to find one receives only a modest penalty.
+    score := baseScore
+    score += nowThreat ? -110 : 5
+    score += defenseFound ? 28 : -5
+
+    if (remainingAfterMove <= 3 && defenseFound)
+        score += 6
+
+    gap := BotHardScoreGap(player)
+    if (gap < 0 && defenseFound)
+        score += 2
+
+    return score
+}
+
+BotHardForbiddenPressurePenalty(distinctForbidden, forbiddenCount, redundantFace, gap) {
+    penalty := 0
+
+    if redundantFace
+        penalty += 16
+
+    ; The first couple of distinct restrictions can be strategically useful.
+    ; Beyond that, each additional Forbidden face shrinks everybody's expression
+    ; space sharply, including the bot's own future writing options.
+    if (distinctForbidden >= 2)
+        penalty += (distinctForbidden - 1) * 5
+
+    if (forbiddenCount >= 5)
+        penalty += (forbiddenCount - 4) * 2
+
+    ; A leader should be less eager to turn a stable board into a restrictive
+    ; high-variance one. A trailing player gets its separate aggression bonus.
+    if (gap < 0)
+        penalty += 3
+
+    return penalty
+}
+
+BotHardFaceIsInZone(face, zone) {
+    global Cubes
+
+    for _, cube in Cubes {
+        if (cube.Zone = zone && cube.Face = face)
+            return true
+    }
+    return false
+}
+
+
+BotHardFaceCountInZone(face, zone) {
+    global Cubes
+
+    count := 0
+    for _, cube in Cubes {
+        if (cube.Zone = zone && cube.Face = face)
+            count += 1
+    }
+    return count
+}
+
+BotHardForbiddenDistinctCount() {
+    global Cubes
+
+    seen := Map()
+    for _, cube in Cubes {
+        if (cube.Zone != "Forbidden")
+            continue
+        if !seen.Has(cube.Face)
+            seen[cube.Face] := true
+    }
+    return seen.Count
+}
+
+BotChooseHardLastCubeMove(player, idx, quick := false) {
+    global Cubes
+
+    oldZone := Cubes[idx].Zone
+    best := {OK: false}
+    bestScore := -1000000
+
+    for _, zone in ["Required", "Permitted"] {
+        Cubes[idx].Zone := zone
+
+        ; Last-cube placement is important enough for a real FORCEOUT probe, but
+        ; 120 trials is sufficient evidence for a bounded heuristic and avoids the
+        ; old 2 x 180-trial tax at the end of every long shake.
+        trials := quick ? 60 : 120
+        witness := BotFindBoardEquation("FORCEOUT", trials)
+
+        score := BotHardCheapMoveScore(player, idx, zone)
+        score += witness.Submitted ? 55 : 0
+
+        if (score > bestScore) {
+            bestScore := score
+            best := {
+                OK: true,
+                Index: idx,
+                Zone: zone,
+                StrategyScore: score,
+                NowThreat: false,
+                DefenseFound: witness.Submitted
+            }
+        }
+    }
+
+    Cubes[idx].Zone := oldZone
+    return best.OK ? best : {OK: true, Index: idx, Zone: "Required"}
+}
+
+BotChooseHardBonus(player) {
+    global Cubes
+
+    resources := BotIndicesInZone("Resources")
+    gap := BotHardScoreGap(player)
+    distinctForbidden := BotHardForbiddenDistinctCount()
+
+    ; BONUS is powerful because it does not end the turn. v4.9 used it far too
+    ; often, paying for another strategy search and flooding Forbidden. Keep it
+    ; for genuinely high-value denial opportunities instead of treating it as an
+    ; almost automatic extra move.
+    if (resources.Length <= 5)
+        return {OK: false}
+    if (distinctForbidden >= 3 && gap <= 0)
+        return {OK: false}
+
+    cheap := []
+    seenFaces := Map()
+    for _, idx in resources {
+        face := Cubes[idx].Face
+        if seenFaces.Has(face)
+            continue
+        seenFaces[face] := true
+        if BotHardFaceIsInZone(face, "Forbidden")
+            continue
+        if BotHardFaceIsInZone(face, "Required")
+            continue
+
+        score := 4 + BotHardFaceDenialValue(face)
+        score -= BotHardForbiddenPressurePenalty(distinctForbidden, CountZone("Forbidden"), false, gap)
+        if IsDigitFace(face)
+            score -= 4
+        if (gap > 0)
+            score += Min(gap, 4)
+        cheap.Push({Index: idx, Score: score})
+    }
+
+    if (cheap.Length = 0)
+        return {OK: false}
+
+    finalists := BotHardTakeTopCandidates(cheap, 1)
+    best := {OK: false}
+    bestScore := -1000000
+
+    for _, candidate in finalists {
+        idx := candidate.Index
+        oldZone := Cubes[idx].Zone
+        Cubes[idx].Zone := "Forbidden"
+
+        try {
+            ; Require positive defense evidence, but search only the strongest
+            ; cheap candidates. This keeps BONUS tactical without doubling the
+            ; cost of nearly every turn.
+            defense := BotFindBoardEquation("IMPOSSIBLE", 10)
+            if !defense.Submitted
+                continue
+
+            remaining := ResourceCount()
+            nowLegal := (remaining >= 2 && (CountZone("Required") + CountZone("Permitted") > 0))
+            nowThreat := false
+            if nowLegal
+                nowThreat := BotFindBoardEquation("NOW", 5).Submitted
+            if nowThreat
+                continue
+
+            score := candidate.Score + 20
+            if (remaining >= 10)
+                score += 3
+
+            if (score > bestScore) {
+                bestScore := score
+                best := {OK: true, Index: idx, Score: score}
+            }
+        } finally {
+            Cubes[idx].Zone := oldZone
+        }
+    }
+
+    ; As the board accumulates restrictions, demand a larger strategic edge from
+    ; BONUS. Trailing players can still take a calculated aggressive shot.
+    threshold := 25 + (distinctForbidden * 4)
+    if (gap > 0)
+        threshold -= Min(gap, 4)
+
+    if (best.OK && best.Score >= threshold)
         return best
-    return BotChooseOrdinaryMove(player)
+    return {OK: false}
+}
+
+BotHardFaceDenialValue(face) {
+    if (face = "^" || face = "sqrt")
+        return 7
+    if (face = "/")
+        return 6
+    if (face = "x")
+        return 5
+    if (face = "+" || face = "-")
+        return 4
+    return 1
+}
+
+BotHardScoreGap(player) {
+    global PlayerCount
+
+    own := EffectiveScore(player)
+    bestOther := -1000000000
+    loop PlayerCount {
+        if (A_Index = player)
+            continue
+        bestOther := Max(bestOther, EffectiveScore(A_Index))
+    }
+
+    if (bestOther = -1000000000)
+        return 0
+    return bestOther - own
 }
 
 BotTryChallengeLastMove() {
@@ -993,7 +2980,7 @@ BotTryChallengeLastMove() {
 
                 t := PlayerTypeName(p)
                 catchChance := (t = "Practice Bot") ? 70 : 100
-                if (Random(1, 100) <= catchChance) {
+                if (EqRandom(1, 100) <= catchChance) {
                     ChallengeDDL.Choose(p)
                     AddBotDiagnostic(PlayerName(p) . " detects an illegal Goal and calls IMPOSSIBLE.")
                     StartChallenge("IMPOSSIBLE")
@@ -1007,6 +2994,7 @@ BotTryChallengeLastMove() {
         return false
 
     nowLegal := (ResourceCount() >= 2 && (CountZone("Required") + CountZone("Permitted") > 0))
+    hardNowChecked := false
 
     loop PlayerCount {
         p := A_Index
@@ -1016,15 +3004,41 @@ BotTryChallengeLastMove() {
         t := PlayerTypeName(p)
 
         if nowLegal {
+            ; All Very Hard opponents are analyzing the same public board state with
+            ; the same referee rules. v4.9.1 repeated 900 randomized trials once per
+            ; opponent (1800 trials in a three-player game). v4.9.2 runs one shared
+            ; 1000-trial search instead: deeper than the old individual check, but no
+            ; duplicate work. If it succeeds, every eligible Very Hard bot receives
+            ; the same referee-valid witness for later Third Party writing.
+            if (t = "Very Hard Bot") {
+                if hardNowChecked
+                    continue
+                hardNowChecked := true
+
+                found := BotFindBoardEquation("NOW", BotHardSharedNowChallengeTrials())
+                if found.Submitted {
+                    loop PlayerCount {
+                        q := A_Index
+                        if (q = LastMover || !IsBotPlayer(q))
+                            continue
+                        if (PlayerTypeName(q) = "Very Hard Bot")
+                            BotCacheEquation(q, "NOW", found)
+                    }
+
+                    ChallengeDDL.Choose(p)
+                    AddBotDiagnostic(PlayerName(p) . " calls NOW after a shared Very Hard search found and cached a candidate Equation.")
+                    StartChallenge("NOW")
+                    return true
+                }
+                continue
+            }
+
             chance := 0
             trials := 0
 
             if (t = "Practice Bot") {
                 chance := 24
                 trials := 180
-            } else if (t = "Very Hard Bot") {
-                chance := 100
-                trials := 900
             } else if (t = "Rules Fuzzer") {
                 chance := (ResourceCount() <= 3) ? 85 : 38
                 trials := 300
@@ -1036,9 +3050,9 @@ BotTryChallengeLastMove() {
                 trials := 180
             }
 
-            if (Random(1, 100) <= chance) {
+            if (EqRandom(1, 100) <= chance) {
                 found := BotFindBoardEquation("NOW", trials)
-                if found.Submitted || t = "Parser Fuzzer" || (t = "Chaos Fuzzer" && Random(1, 100) <= 25) {
+                if found.Submitted || t = "Parser Fuzzer" || (t = "Chaos Fuzzer" && EqRandom(1, 100) <= 25) {
                     if found.Submitted
                         BotCacheEquation(p, "NOW", found)
                     ChallengeDDL.Choose(p)
@@ -1052,7 +3066,7 @@ BotTryChallengeLastMove() {
         ; Rules/Chaos fuzzers occasionally make a legal IMPOSSIBLE challenge to
         ; exercise scoring/checking even when they have not proved impossibility.
         ; This is deliberate adversarial testing, not claimed optimal play.
-        if ((t = "Rules Fuzzer" && Random(1, 100) <= 5) || (t = "Chaos Fuzzer" && Random(1, 100) <= 8)) {
+        if ((t = "Rules Fuzzer" && EqRandom(1, 100) <= 5) || (t = "Chaos Fuzzer" && EqRandom(1, 100) <= 8)) {
             ChallengeDDL.Choose(p)
             AddBotDiagnostic(PlayerName(p) . " makes an adversarial IMPOSSIBLE test challenge.")
             StartChallenge("IMPOSSIBLE")
@@ -1061,6 +3075,13 @@ BotTryChallengeLastMove() {
     }
 
     return false
+}
+
+BotHardSharedNowChallengeTrials() {
+    ; One shared search replaces two independent 900-trial searches on the same
+    ; board. 1000 keeps the individual tactical depth at least as strong while
+    ; substantially reducing duplicate work in three-player Very Hard games.
+    return 1000
 }
 
 GetEquationEntry(player, roleText, mode, manageTimer := true) {
@@ -1089,12 +3110,12 @@ BotGenerateEquationEntry(player, mode) {
     playerType := PlayerTypeName(player)
 
     if (playerType = "Parser Fuzzer") {
-        if (Random(1, 100) <= 62)
+        if (EqRandom(1, 100) <= 62)
             return BotParserFuzzEntry()
         return BotFindBoardEquation(mode, BotSearchTrialsFuzzer)
     }
 
-    if (playerType = "Chaos Fuzzer" && Random(1, 100) <= 35)
+    if (playerType = "Chaos Fuzzer" && EqRandom(1, 100) <= 35)
         return BotParserFuzzEntry()
 
     trials := BotSearchTrialsPractice
@@ -1124,14 +3145,14 @@ BotParserFuzzEntry() {
         "(((1+2)x3)-4)", "(9/(3-3))"
     ]
 
-    expr := expressions[Random(1, expressions.Length)]
+    expr := expressions[EqRandom(1, expressions.Length)]
     return {Submitted: true, Solution: expr, Goal: goal.Expr}
 }
 
 BotGenerateNoGoalEquationEntry(player) {
     playerType := PlayerTypeName(player)
 
-    if (playerType = "Parser Fuzzer" && Random(1, 100) <= 50)
+    if (playerType = "Parser Fuzzer" && EqRandom(1, 100) <= 50)
         return {Submitted: true, Solution: "8/0", Goal: "0"}
 
     trials := (playerType = "Very Hard Bot") ? 1200 : 360
@@ -1144,6 +3165,10 @@ BotThirdPartyWillWrite(player, context) {
     if (playerType = "Very Hard Bot") {
         mode := InStr(context, "NOW") ? "NOW" : (InStr(context, "IMPOSSIBLE") ? "IMPOSSIBLE" : "")
         if (mode != "") {
+            cached := BotPeekCachedEquation(player, mode)
+            if cached.Found
+                return true
+
             found := BotFindBoardEquation(mode, 420)
             if found.Submitted {
                 BotCacheEquation(player, mode, found)
@@ -1155,13 +3180,13 @@ BotThirdPartyWillWrite(player, context) {
     }
 
     if (playerType = "Practice Bot")
-        return (Random(1, 100) <= 50)
+        return (EqRandom(1, 100) <= 50)
     if (playerType = "Rules Fuzzer")
-        return (Random(1, 100) <= 70)
+        return (EqRandom(1, 100) <= 70)
     if (playerType = "Parser Fuzzer")
         return true
     if (playerType = "Chaos Fuzzer")
-        return (Random(1, 100) <= 50)
+        return (EqRandom(1, 100) <= 50)
 
     return false
 }
@@ -1182,80 +3207,58 @@ BotFindBoardEquation(mode, trials := 400) {
     if (mode = "FORCEOUT")
         resources := []
 
+    ; v4.8: all of these values are invariant across the bounded search. Hoist
+    ; them out of the trial loop rather than recalculating them thousands of times.
+    totalUsable := required.Length + permitted.Length + resources.Length
+    maxTotal := Min(9, totalUsable)
+    if (maxTotal < required.Length)
+        maxTotal := required.Length
+    if (maxTotal < 2)
+        maxTotal := 2
+
+    desiredMin := Max(2, required.Length)
+    if (desiredMin > maxTotal)
+        desiredMin := maxTotal
+
+    resourceCap := (mode = "NOW") ? 1 : 5
     BotSearchAttemptsLast := 0
 
     loop trials {
         BotSearchAttemptsLast := A_Index
         selected := BotCopyArray(required)
+        desired := EqRandomInt(desiredMin, maxTotal)
 
-        totalUsable := required.Length + permitted.Length + resources.Length
-        maxTotal := Min(9, totalUsable)
-        if (maxTotal < required.Length)
-            maxTotal := required.Length
-        if (maxTotal < 2)
-            maxTotal := 2
-        desiredMin := Max(2, selected.Length)
-        if (desiredMin > maxTotal)
-            desiredMin := maxTotal
-        desired := Random(desiredMin, maxTotal)
+        ; Partial random sampling avoids fully shuffling the Permitted and
+        ; Resource pools on every trial. Each candidate is still considered in
+        ; random order and still uses the same inclusion probabilities.
+        BotAppendRandomCandidates(selected, permitted, desired, 62)
+        usedResources := BotAppendRandomCandidates(selected, resources, desired, 58, resourceCap)
 
-        permCopy := BotShuffledCopy(permitted)
-        for _, idx in permCopy {
-            if (selected.Length >= desired)
-                break
-            if (Random(1, 100) <= 62)
-                selected.Push(idx)
-        }
+        ; If Required alone has fewer than two cubes, fill from legal optional
+        ; pools. The helper skips anything already selected.
+        if (selected.Length < 2)
+            BotAppendRandomCandidates(selected, permitted, 2, 100)
 
-        resourceCap := (mode = "NOW") ? 1 : 5
-        usedResources := 0
-        resCopy := BotShuffledCopy(resources)
-        for _, idx in resCopy {
-            if (selected.Length >= desired || usedResources >= resourceCap)
-                break
-            if (Random(1, 100) <= 58) {
-                selected.Push(idx)
-                usedResources += 1
-            }
-        }
-
-        ; If Required alone has fewer than two cubes, fill from legal optional pools.
-        if (selected.Length < 2) {
-            fill := BotShuffledCopy(permitted)
-            for _, idx in fill {
-                if !BotArrayHas(selected, idx)
-                    selected.Push(idx)
-                if (selected.Length >= 2)
-                    break
-            }
-        }
-
-        if (selected.Length < 2 && resources.Length > 0) {
-            for _, idx in resources {
-                if !BotArrayHas(selected, idx) {
-                    selected.Push(idx)
-                    usedResources += 1
-                }
-                if (selected.Length >= 2 || (mode = "NOW" && usedResources >= 1))
-                    break
-            }
-        }
+        if (selected.Length < 2 && resources.Length > 0 && usedResources < resourceCap)
+            usedResources += BotAppendRandomCandidates(selected, resources, 2, 100, resourceCap - usedResources)
 
         if (selected.Length < 2)
             continue
 
-        exprResult := BotBuildExpressionFromIndices(selected)
+        ; Choose the Goal before building the expression. The v4.8 builder can
+        ; then try both legal final operand orientations instead of throwing away
+        ; a candidate merely because the last non-commutative pair was reversed.
+        goal := goals[EqRandomInt(1, goals.Length)]
+        exprResult := BotBuildExpressionFromIndices(selected, true, goal.Value)
         if !exprResult.OK
             continue
 
-        goal := goals[Random(1, goals.Length)]
-
-        ; v4.6.2 independent bot-side arithmetic guard. BotBuildExpressionFromIndices
-        ; evaluates the exact generated tree as it builds it. Require that value
-        ; to match the selected Goal before asking the normal referee checker.
+        ; Keep the independent arithmetic guard from v4.6.2.
         if !NearlyEqual(exprResult.Value, goal.Value)
             continue
 
+        ; IMPORTANT: the normal referee remains the final acceptance gate. The
+        ; optimization only finds candidates faster; it does not bypass rules.
         entry := {Submitted: true, Solution: exprResult.Expr, Goal: goal.Expr}
         checked := CheckBoardEquation(entry, mode)
         if checked.Correct {
@@ -1276,9 +3279,9 @@ BotFindExpressionToTarget(poolIndices, target, trials := 300, minCubes := 2, max
     lower := Min(minCubes, upper)
 
     loop trials {
-        count := Random(lower, upper)
+        count := EqRandomInt(lower, upper)
         selected := BotRandomDistinct(poolIndices, count)
-        built := BotBuildExpressionFromIndices(selected)
+        built := BotBuildExpressionFromIndices(selected, true, target)
         if !built.OK
             continue
 
@@ -1312,7 +3315,7 @@ BotFindNoGoalEquation(trials := 500) {
         return {Submitted: false, Solution: "", Goal: ""}
 
     loop trials {
-        goalCount := Random(1, Min(4, resources.Length - 2))
+        goalCount := EqRandom(1, Min(4, resources.Length - 2))
         goalIndices := BotRandomDistinct(resources, goalCount)
         candidate := BotBuildGoalCandidate(goalIndices)
         if !candidate.OK
@@ -1331,7 +3334,7 @@ BotFindNoGoalEquation(trials := 500) {
     return {Submitted: false, Solution: "", Goal: ""}
 }
 
-BotBuildExpressionFromIndices(indices) {
+BotBuildExpressionFromIndices(indices, targetKnown := false, target := 0) {
     global Cubes
 
     if (indices.Length = 0)
@@ -1360,17 +3363,17 @@ BotBuildExpressionFromIndices(indices) {
     if ((otherOps.Length + roots.Length) < binaryNeeded)
         return {OK: false, Expr: "", Value: 0}
 
-    shuffledRoots := BotShuffledCopy(roots)
+    ; v4.8: randomly take only the radical cubes needed as binary nth-root
+    ; operators. The remaining radical cubes become unary square roots. This
+    ; replaces a full roots-array shuffle plus RemoveAt(1) churn.
+    availableRoots := BotCopyArray(roots)
     binaryOps := BotCopyArray(otherOps)
     rootBinaryNeeded := binaryNeeded - otherOps.Length
 
-    loop rootBinaryNeeded {
-        binaryOps.Push(shuffledRoots.RemoveAt(1))
-    }
+    loop rootBinaryNeeded
+        binaryOps.Push(BotPopRandom(availableRoots))
 
-    unaryRoots := shuffledRoots
-    numbers := BotShuffledCopy(numbers)
-    binaryOps := BotShuffledCopy(binaryOps)
+    unaryRoots := availableRoots
 
     operands := []
     for _, idx in numbers
@@ -1378,9 +3381,8 @@ BotBuildExpressionFromIndices(indices) {
 
     ; Extra radical cubes are legal unary square roots. Apply them to randomly
     ; selected existing operands, preserving every physical cube exactly once.
-    ; v4.6.2 also evaluates the generated tree independently while building it.
     for _, rootIdx in unaryRoots {
-        targetPos := Random(1, operands.Length)
+        targetPos := EqRandomInt(1, operands.Length)
         calc := ApplyRoot(2, operands[targetPos].Value)
         if !calc.OK
             return {OK: false, Expr: "", Value: 0}
@@ -1389,55 +3391,99 @@ BotBuildExpressionFromIndices(indices) {
     }
 
     while (operands.Length > 1) {
-        operands := BotShuffledCopy(operands)
-        left := operands.RemoveAt(operands.Length)
-        right := operands.RemoveAt(operands.Length)
-        opIdx := binaryOps.RemoveAt(binaryOps.Length)
+        ; Old versions copied and Fisher-Yates shuffled the entire operands array
+        ; before EVERY binary combine. Random pop/swap gives the same kind of
+        ; randomized pairing without repeated full-array allocations.
+        left := BotPopRandom(operands)
+        right := BotPopRandom(operands)
+        opIdx := BotPopRandom(binaryOps)
         op := Cubes[opIdx].Face
 
-        if (op = "sqrt") {
-            calc := ApplyRoot(left.Value, right.Value)
-            if !calc.OK
-                return {OK: false, Expr: "", Value: 0}
-            expr := "(" . left.Expr . ")sqrt(" . right.Expr . ")"
-        } else {
-            calc := ApplyBinary(op, left.Value, right.Value)
-            if !calc.OK
-                return {OK: false, Expr: "", Value: 0}
-            expr := "(" . left.Expr . op . right.Expr . ")"
+        ; On the final combine, a known Goal target lets us cheaply try both
+        ; operand orientations. This is especially useful for -, /, ^, and nth
+        ; root, where one direction may hit the Goal and the other cannot.
+        if (targetKnown && operands.Length = 0 && binaryOps.Length = 0) {
+            first := BotCombineOperands(left, right, op)
+            if (first.OK && NearlyEqual(first.Value, target))
+                return first
+
+            second := BotCombineOperands(right, left, op)
+            if (second.OK && NearlyEqual(second.Value, target))
+                return second
+
+            return {OK: false, Expr: "", Value: 0}
         }
 
-        operands.Push({Expr: expr, Value: calc.Value})
+        combined := BotCombineOperands(left, right, op)
+        if !combined.OK
+            return {OK: false, Expr: "", Value: 0}
+
+        operands.Push(combined)
     }
 
     if (binaryOps.Length != 0)
         return {OK: false, Expr: "", Value: 0}
 
-    return {OK: true, Expr: operands[1].Expr, Value: operands[1].Value}
+    result := operands[1]
+    if (targetKnown && !NearlyEqual(result.Value, target))
+        return {OK: false, Expr: "", Value: 0}
+
+    return {OK: true, Expr: result.Expr, Value: result.Value}
 }
 
-BotLegalGoalInterpretations() {
-    global GoalPhysicalExpr
-
-    out := []
-    analysis := ParsePhysicalGoalExpression(GoalPhysicalExpr)
-    if !analysis.OK
-        return out
-
-    seen := Map()
-    for _, result in analysis.Results {
-        expr := BotCanonToInput(result.Canon)
-        if (expr = "" || seen.Has(expr))
-            continue
-
-        check := CheckPresentedGoal(expr)
-        if check.OK {
-            seen[expr] := true
-            out.Push({Expr: expr, Value: check.Value})
+BotCombineOperands(left, right, op) {
+    if (op = "sqrt") {
+        calc := ApplyRoot(left.Value, right.Value)
+        if !calc.OK
+            return {OK: false, Expr: "", Value: 0}
+        return {
+            OK: true,
+            Expr: "(" . left.Expr . ")sqrt(" . right.Expr . ")",
+            Value: calc.Value
         }
     }
 
-    return out
+    calc := ApplyBinary(op, left.Value, right.Value)
+    if !calc.OK
+        return {OK: false, Expr: "", Value: 0}
+
+    return {
+        OK: true,
+        Expr: "(" . left.Expr . op . right.Expr . ")",
+        Value: calc.Value
+    }
+}
+
+BotLegalGoalInterpretations() {
+    global GoalPhysicalExpr, Division, BotGoalInterpretationCacheKey, BotGoalInterpretationCache
+
+    cacheKey := Division . "|" . GoalPhysicalExpr
+    if (cacheKey = BotGoalInterpretationCacheKey)
+        return BotGoalInterpretationCache
+
+    out := []
+    analysis := ParsePhysicalGoalExpression(GoalPhysicalExpr)
+    if analysis.OK {
+        seen := Map()
+        for _, result in analysis.Results {
+            expr := BotCanonToInput(result.Canon)
+            if (expr = "" || seen.Has(expr))
+                continue
+
+            ; Keep the same referee-side Goal validation used before v4.8. This
+            ; work is now paid once per distinct physical Goal instead of once
+            ; per search call.
+            check := CheckPresentedGoal(expr)
+            if check.OK {
+                seen[expr] := true
+                out.Push({Expr: expr, Value: check.Value})
+            }
+        }
+    }
+
+    BotGoalInterpretationCacheKey := cacheKey
+    BotGoalInterpretationCache := out
+    return BotGoalInterpretationCache
 }
 
 BotFirstLegalGoalInterpretation() {
@@ -1570,12 +3616,50 @@ BotMapFacesToIndices(faces, candidates) {
     return out
 }
 
+BotPopRandom(arr) {
+    if (arr.Length = 0)
+        return 0
+
+    pos := EqRandomInt(1, arr.Length)
+    value := arr[pos]
+    last := arr.Pop()
+    if (pos <= arr.Length)
+        arr[pos] := last
+    return value
+}
+
+BotAppendRandomCandidates(selected, pool, desiredTotal, chancePercent, maxAdd := 1000000) {
+    if (pool.Length = 0 || selected.Length >= desiredTotal || maxAdd <= 0)
+        return 0
+
+    work := BotCopyArray(pool)
+    remaining := work.Length
+    added := 0
+
+    while (remaining > 0 && selected.Length < desiredTotal && added < maxAdd) {
+        pick := EqRandomInt(1, remaining)
+        idx := work[pick]
+        work[pick] := work[remaining]
+        remaining -= 1
+
+        if BotArrayHas(selected, idx)
+            continue
+
+        if (chancePercent >= 100 || EqRandomInt(1, 100) <= chancePercent) {
+            selected.Push(idx)
+            added += 1
+        }
+    }
+
+    return added
+}
+
 BotRandomDistinct(arr, count) {
-    copy := BotShuffledCopy(arr)
+    copy := BotCopyArray(arr)
     out := []
     count := Min(count, copy.Length)
     loop count
-        out.Push(copy[A_Index])
+        out.Push(BotPopRandom(copy))
     return out
 }
 
@@ -1639,9 +3723,49 @@ BotTakeCachedEquation(player, mode) {
     return {Found: true, Entry: entry}
 }
 
+
+BotPeekCachedEquation(player, mode) {
+    global BotCachedEquationEntries
+
+    key := player . "|" . mode
+    if !BotCachedEquationEntries.Has(key)
+        return {Found: false, Entry: {Submitted: false, Solution: "", Goal: ""}}
+
+    return {Found: true, Entry: BotCachedEquationEntries[key]}
+}
+
+
+FormatBotMoveLogLine(sequence, shake, phase, message) {
+    return "#" . sequence . " | Shake " . shake . " | " . phase . " | " . message
+}
+
+RecordBotMove(message) {
+    global BotLabWorker, BotLabMoveBuffer, BotLabMoveSequence, ShakeNumber, Phase
+
+    if !BotLabWorker
+        return
+
+    BotLabMoveSequence += 1
+    BotLabMoveBuffer.Push(FormatBotMoveLogLine(BotLabMoveSequence, ShakeNumber, Phase, message))
+    if (BotLabMoveBuffer.Length >= 1000)
+        FlushBotMoveLog()
+}
+
+FlushBotMoveLog(*) {
+    global BotLabWorker, BotLabMoveLogFile, BotLabMoveBuffer
+
+    if !BotLabWorker || BotLabMoveLogFile = "" || BotLabMoveBuffer.Length = 0
+        return
+
+    text := JoinArray(BotLabMoveBuffer, "`r`n") . "`r`n"
+    try FileAppend(text, BotLabMoveLogFile, "UTF-8")
+    BotLabMoveBuffer := []
+}
+
 AddBotDiagnostic(message) {
     global BotDiagnosticLines
 
+    RecordBotMove(message)
     BotDiagnosticLines.Push(message)
     while (BotDiagnosticLines.Length > 120)
         BotDiagnosticLines.RemoveAt(1)
@@ -1649,16 +3773,23 @@ AddBotDiagnostic(message) {
     AddLog("[BOT] " . message)
 }
 
-ShowBotDiagnostics(*) {
+BuildBotDiagnosticsText() {
     global PlayerCount, Players, PlayerTypes, BotAutoRun, BotAutoRunMaxShakes
     global BotActionSerial, BotChallengeCheckedSerial, BotSearchAttemptsLast
     global BotSearchSuccesses, BotSearchFailures, BotDiagnosticLines, BotCachedEquationEntries, Phase, ShakeNumber
+    global AppMode, SessionSeed, SeededRandomEnabled, BotLabWorker, BotLabWorkerId
 
     seats := []
     loop PlayerCount
         seats.Push(Players[A_Index] . " = " . PlayerTypes[A_Index])
 
-    text := "Phase: " . Phase . " | Shake: " . ShakeNumber
+    seedText := SeededRandomEnabled ? SessionSeed : "native random"
+    modeText := AppMode
+    if BotLabWorker
+        modeText .= " (Worker " . BotLabWorkerId . ")"
+
+    text := "Mode: " . modeText . " | Seed: " . seedText
+        . "`nPhase: " . Phase . " | Shake: " . ShakeNumber
         . "`nBot Lab: " . (BotAutoRun ? "ON (limit " . BotAutoRunMaxShakes . ")" : "off")
         . "`nAction serial: " . BotActionSerial . " | challenge checked: " . BotChallengeCheckedSerial
         . "`nLast bounded-search attempts: " . BotSearchAttemptsLast
@@ -1669,9 +3800,14 @@ ShowBotDiagnostics(*) {
     if (BotDiagnosticLines.Length > 0)
         text .= "`n`nRecent bot decisions:`n" . JoinArray(BotDiagnosticLines, "`n")
 
+    return text
+}
+
+ShowBotDiagnostics(*) {
+    text := BuildBotDiagnosticsText()
     A_Clipboard := text
     ClipWait(1)
-    MsgBox("Bot diagnostics copied to the clipboard.`n`nPaste them with Ctrl+V.", "EQUATIONS v4.6.4 - Bot diagnostics")
+    MsgBox("Bot diagnostics copied to the clipboard.`n`nPaste them with Ctrl+V.", "EQUATIONS v4.9.2 - Bot diagnostics")
 }
 
 
@@ -1688,8 +3824,12 @@ BuildGui() {
     global NextShakeBtn, EndMatchBtn, HistoryBtn, Players
     global CubeColors, CubeTextColors, TimerText, TimerPurposeText
     global OneMinBtn, TwoMinBtn, ResetTimerBtn
+    global BotLabWorker, BotLabWorkerId, SessionSeed
 
-    MainGui := Gui("", "Academic Games EQUATIONS - Digital Tabletop")
+    title := "Academic Games EQUATIONS - Digital Tabletop v4.9.2"
+    if BotLabWorker
+        title .= " - Worker " . BotLabWorkerId . " - Seed " . SessionSeed
+    MainGui := Gui("", title)
     MainGui.BackColor := "F3F0E8"
     MainGui.SetFont("s10", "Segoe UI")
     MainGui.OnEvent("Close", CloseMain)
@@ -2026,6 +4166,7 @@ StartShake(rotateGoalSetter := true) {
     AddLog("")
     AddLog("--- SHAKE " . ShakeNumber . " ---")
     AddLog("Goal-setter: " . PlayerName(GoalSetter) . ". 24 cubes rolled.")
+    WriteBotLabWorkerStatus("RUNNING")
     UpdateGui()
     StartRuleTimer(120, "Setting the Goal", GoalSetter, true)
     ScheduleBotController()
@@ -2052,7 +4193,7 @@ RollAllCubes() {
                 Id: id,
                 Color: color,
                 PhysicalNumber: cubeNumber,
-                Face: faces[Random(1, faces.Length)],
+                Face: faces[EqRandom(1, faces.Length)],
                 Zone: "Resources",
                 HomeSlot: slots[id]
             })
@@ -2063,7 +4204,7 @@ RollAllCubes() {
 RandomFace(color) {
     global ColorFaces
     faces := ColorFaces[color]
-    return faces[Random(1, faces.Length)]
+    return faces[EqRandom(1, faces.Length)]
 }
 
 CubeClicked(idx, *) {
@@ -2095,7 +4236,7 @@ PlaceSelected(zone, *) {
     global CurrentPlayer, LastMover, LastAction, BonusUsedThisTurn, ForceoutStartTick
 
     if !SelectedCube {
-        SoundBeep(800, 80)
+        EqSoundBeep(800, 80)
         return
     }
 
@@ -3668,6 +5809,22 @@ SafePower(base, exponent) {
         return {OK: false}
 
     if (base < 0) {
+        ; v4.8 fast path: bot-generated powers very often have an integer
+        ; exponent. Avoid the up-to-200-denominator fraction search in that case.
+        if (Abs(exponent) <= 9.0e15) {
+            roundedExponent := Round(exponent)
+            if NearlyEqual(exponent, roundedExponent) {
+                try {
+                    magnitude := ((Abs(base) + 0.0) ** roundedExponent)
+                } catch {
+                    return {OK: false}
+                }
+
+                sign := (Mod(Abs(roundedExponent), 2) = 1) ? -1 : 1
+                return ValidNumber(sign * magnitude)
+            }
+        }
+
         frac := ApproxFraction(exponent)
         if !frac.OK
             return {OK: false}
@@ -3914,6 +6071,7 @@ FinalizeShake(baseScores, reason) {
     CurrentPlayer := 0
     SelectedCube := 0
     BonusUsedThisTurn := false
+    WriteBotLabWorkerStatus("RUNNING", "Shake complete")
     UpdateGui()
 
     if !BotAutoRun {
@@ -4170,7 +6328,7 @@ DisplayFace(face) {
 ShuffleArray(arr) {
     i := arr.Length
     while (i > 1) {
-        j := Random(1, i)
+        j := EqRandomInt(1, i)
         temp := arr[i]
         arr[i] := arr[j]
         arr[j] := temp
@@ -4346,7 +6504,16 @@ StartManualTimer(seconds, *) {
 
 StartRuleTimer(seconds, purpose, owner := 0, penaltyEligible := true, penaltyStage := 0) {
     global TimerPurpose, TimerOwner, TimerRuleManaged, TimerPenaltyEligible, TimerPenaltyStage
-    global TimerGraceRemaining, TimerTaskToken
+    global TimerGraceRemaining, TimerTaskToken, BotLabWorker
+
+    ; Multi-instance stress workers run game-state logic as fast as possible.
+    ; Real wall-clock tournament penalties would make results depend on CPU load
+    ; and could strand hidden workers behind a penalty dialog, so worker copies
+    ; deliberately suppress rule clocks. WATCH BOT GAME and normal play retain them.
+    if BotLabWorker {
+        ResetBoardTimer()
+        return
+    }
 
     TimerTaskToken += 1
     TimerPurpose := purpose
@@ -4413,8 +6580,8 @@ BoardTimerTick(*) {
             TimerGraceRemaining := 0
             TimerRunning := false
             SetTimer(BoardTimerTick, 0)
-            SoundBeep(950, 160)
-            SoundBeep(1150, 180)
+            EqSoundBeep(950, 160)
+            EqSoundBeep(1150, 180)
 
             if (TimerRuleManaged && TimerPenaltyEligible && TimerOwner > 0) {
                 owner := TimerOwner
@@ -4435,7 +6602,7 @@ BoardTimerTick(*) {
         ImpossibleBtn.Enabled := false
 
     if (TimerRemaining = 10)
-        SoundBeep(850, 90)
+        EqSoundBeep(850, 90)
 
     if (TimerRemaining <= 0) {
         TimerRemaining := 0
@@ -4444,13 +6611,13 @@ BoardTimerTick(*) {
             ; Tournament rule: announce time, then allow the required 10-second
             ; countdown before a one-point time penalty can be imposed.
             TimerGraceRemaining := 10
-            SoundBeep(950, 160)
+            EqSoundBeep(950, 160)
             AddLog("Time limit reached for " . PlayerName(TimerOwner) . " (" . TimerPurpose . "). Ten-second countdown begins.")
         } else {
             TimerRunning := false
             SetTimer(BoardTimerTick, 0)
-            SoundBeep(950, 160)
-            SoundBeep(1150, 180)
+            EqSoundBeep(950, 160)
+            EqSoundBeep(1150, 180)
         }
     }
 
@@ -4505,7 +6672,10 @@ OfferTimePenalty(player, purpose, token, stage, *) {
 
 UpdateTimerControls() {
     global OneMinBtn, TwoMinBtn, ResetTimerBtn, Phase, TimerRuleManaged, TimerRunning
+    global RenderEnabled
 
+    if !RenderEnabled
+        return
     if !IsObject(OneMinBtn)
         return
 
@@ -4519,6 +6689,10 @@ UpdateTimerControls() {
 }
 
 UpdateTimerText() {
+    global RenderEnabled
+    if !RenderEnabled
+        return
+
     global TimerText, TimerPurposeText, TimerRemaining, TimerRunning
     global TimerGraceRemaining, TimerPurpose, TimerOwner, TimerRuleManaged
 
@@ -4566,6 +6740,10 @@ ShowHistory(*) {
 ; ============================================================================
 
 UpdateGui() {
+    global RenderEnabled
+    if !RenderEnabled
+        return
+
     global PlayerCount, Players, PlayerTypes, Division, Totals, ShakeDelta, MatchPoints
     global GoalSetter, CurrentPlayer, LastMover, LastAction, Phase, ShakeNumber
     global Cubes, CubeButtons, SelectedCube, ScoreText, StatusText, ResourcesText, SelectedText
@@ -4759,6 +6937,8 @@ UpdateGui() {
 
 RunRegressionTests(*) {
     global Division, PhysicalCubeFaces, ColorFaces, PlayerCount, PlayerTypes, Cubes, BotCachedEquationEntries
+    global SeededRandomEnabled, SeedState, SessionSeed
+    global Totals, ShakeDelta
 
     originalDivision := Division
     failures := []
@@ -4854,6 +7034,19 @@ RunRegressionTests(*) {
         )
     }
 
+    ; v4.8 SafePower fast path must preserve negative-base integer powers and
+    ; still fall back correctly for legal odd-denominator fractional exponents.
+    negEven := SafePower(-3, 4)
+    negOddReciprocal := SafePower(-2, -3)
+    negCubeRoot := SafePower(-8, 1 / 3)
+    if (negEven.OK && NearlyEqual(negEven.Value, 81)
+        && negOddReciprocal.OK && NearlyEqual(negOddReciprocal.Value, -0.125)
+        && negCubeRoot.OK && NearlyEqual(negCubeRoot.Value, -2)) {
+        passed += 1
+    } else {
+        failures.Push("v4.8 negative-base SafePower fast/fallback regression failed")
+    }
+
     if (BotTopLevelComma("3,(4+5)") = 2)
         passed += 1
     else
@@ -4888,6 +7081,21 @@ RunRegressionTests(*) {
             passed += 1
         else
             failures.Push("Bot unary-root expression builder failed on sqrt,9")
+
+
+        ; v4.8 target-aware final combine must be able to reverse a
+        ; non-commutative final pair when only the reverse reaches the target.
+        Cubes := [
+            {Face: "2"},
+            {Face: "-"},
+            {Face: "5"}
+        ]
+        targetBuilt := BotBuildExpressionFromIndices([1, 2, 3], true, 3)
+        targetAnalysis := targetBuilt.OK ? ParseExpression(targetBuilt.Expr, "Solution") : {OK: false}
+        if (targetBuilt.OK && NearlyEqual(targetBuilt.Value, 3) && targetAnalysis.OK && targetAnalysis.Results.Length = 1 && NearlyEqual(targetAnalysis.Results[1].Value, 3))
+            passed += 1
+        else
+            failures.Push("v4.8 target-aware final operand reversal failed on 5-2=3")
     } finally {
         Cubes := savedCubes
     }
@@ -4907,14 +7115,136 @@ RunRegressionTests(*) {
         BotCachedEquationEntries := savedCache
     }
 
+    ; v4.7 deterministic RNG must replay the same sequence without disturbing
+    ; the active game's generator state when the self-test finishes.
+    savedSeedEnabled := SeededRandomEnabled
+    savedSeedState := SeedState
+    savedSessionSeed := SessionSeed
+    try {
+        SetSessionSeed(123456)
+        seqA := [EqRandom(1, 1000000), EqRandom(1, 1000000), EqRandom(1, 1000000), EqRandom(1, 1000000)]
+        SetSessionSeed(123456)
+        seqB := [EqRandom(1, 1000000), EqRandom(1, 1000000), EqRandom(1, 1000000), EqRandom(1, 1000000)]
+        if (JoinArray(seqA, ",") = JoinArray(seqB, ","))
+            passed += 1
+        else
+            failures.Push("Deterministic seed replay produced different random sequences")
+
+        if (DeriveWorkerSeed(5000, 1) != DeriveWorkerSeed(5000, 2))
+            passed += 1
+        else
+            failures.Push("Worker seed derivation did not separate worker streams")
+
+        quickStages := BuildBenchmarkStages(16, "QUICK")
+        if (JoinArray(quickStages, ",") = "1,2,4,8,12,16")
+            passed += 1
+        else
+            failures.Push("PC benchmark quick-stage generation failed: " . JoinArray(quickStages, ","))
+
+        moveLine := FormatBotMoveLogLine(7, 12, "Play", "Very Hard Bot 1 chooses R:2 -> Required.")
+        if InStr(moveLine, "#7 | Shake 12 | Play | Very Hard Bot 1 chooses R:2 -> Required.")
+            passed += 1
+        else
+            failures.Push("Buffered bot move-log formatting failed")
+
+
+        SetSessionSeed(246810)
+        fastSeq := [EqRandomInt(1, 1000000), EqRandomInt(1, 1000000), EqRandomInt(1, 1000000)]
+        SetSessionSeed(246810)
+        normalSeq := [EqRandom(1, 1000000), EqRandom(1, 1000000), EqRandom(1, 1000000)]
+        if (JoinArray(fastSeq, ",") = JoinArray(normalSeq, ","))
+            passed += 1
+        else
+            failures.Push("v4.8 integer RNG fast path diverged from EqRandom")
+    } finally {
+        SeededRandomEnabled := savedSeedEnabled
+        SeedState := savedSeedState
+        SessionSeed := savedSessionSeed
+    }
+
+    ; v4.9.2 strategy-helper regressions are deterministic and do not need a live
+    ; board position. They guard the new priorities without asserting that a
+    ; bounded search failure proves mathematical impossibility.
+    if (BotHardFaceDenialValue("^") > BotHardFaceDenialValue("1")
+        && BotHardFaceDenialValue("/") > BotHardFaceDenialValue("+"))
+        passed += 1
+    else
+        failures.Push("v4.9.2 face-denial priorities are inconsistent")
+
+    rankedProbe := BotHardTakeTopCandidates([
+        {Index: 1, Zone: "Required", Score: 4},
+        {Index: 2, Zone: "Permitted", Score: 12},
+        {Index: 3, Zone: "Forbidden", Score: 7}
+    ], 2)
+    if (rankedProbe.Length = 2 && rankedProbe[1].Score = 12 && rankedProbe[2].Score = 7)
+        passed += 1
+    else
+        failures.Push("v4.9.2 tactical shortlist ranking failed")
+
+    diverseProbe := BotHardBuildDiverseShortlist([
+        {Index: 1, Zone: "Required", Score: 30},
+        {Index: 2, Zone: "Required", Score: 29},
+        {Index: 3, Zone: "Permitted", Score: 8},
+        {Index: 4, Zone: "Forbidden", Score: 7}
+    ], 3)
+    seenReq := false
+    seenPerm := false
+    seenForbid := false
+    for _, candidate in diverseProbe {
+        if (candidate.Zone = "Required")
+            seenReq := true
+        else if (candidate.Zone = "Permitted")
+            seenPerm := true
+        else if (candidate.Zone = "Forbidden")
+            seenForbid := true
+    }
+    if (diverseProbe.Length = 3 && seenReq && seenPerm && seenForbid)
+        passed += 1
+    else
+        failures.Push("v4.9.2 diverse shortlist did not preserve all move classes")
+
+    lowPressure := BotHardForbiddenPressurePenalty(1, 2, false, 0)
+    highPressure := BotHardForbiddenPressurePenalty(4, 7, false, 0)
+    redundantPressure := BotHardForbiddenPressurePenalty(1, 2, true, 0)
+    if (highPressure > lowPressure && redundantPressure > lowPressure)
+        passed += 1
+    else
+        failures.Push("v4.9.2 Forbidden-pressure control did not increase with saturation/redundancy")
+
+    easyCandidate := {Indices: [1, 2, 3], Expr: "(0+1)", Value: 1}
+    hardCandidate := {Indices: [1, 2, 3], Expr: "(7-3)", Value: 4}
+    easyWitness := {OK: true, Indices: [1, 2]}
+    hardWitness := {OK: true, Indices: [1, 2, 3, 4, 5, 6]}
+    if (BotHardGoalStrategicScore(hardCandidate, hardWitness) > BotHardGoalStrategicScore(easyCandidate, easyWitness))
+        passed += 1
+    else
+        failures.Push("v4.9.2 Goal strategy did not prefer the stronger witnessed candidate")
+
+    savedPlayerCount := PlayerCount
+    savedTotals := Totals
+    savedShakeDelta := ShakeDelta
+    try {
+        PlayerCount := 3
+        Totals := [4, 10, 7]
+        ShakeDelta := [0, 0, 0]
+        if (BotHardScoreGap(1) = 6 && BotHardScoreGap(2) = -3)
+            passed += 1
+        else
+            failures.Push("v4.9.2 score-pressure helper returned the wrong gap")
+    } finally {
+        PlayerCount := savedPlayerCount
+        Totals := savedTotals
+        ShakeDelta := savedShakeDelta
+    }
+
     Division := originalDivision
 
     if (failures.Length = 0) {
-        MsgBox("All " . passed . " v4.6.4 regression checks passed.", "EQUATIONS v4.6.4 self-test")
+        MsgBox("All " . passed . " v4.9.2 regression checks passed.", "EQUATIONS v4.9.2 self-test")
     } else {
         MsgBox(
             passed . " checks passed; " . failures.Length . " failed.`n`n" . JoinArray(failures, "`n"),
-            "EQUATIONS v4.6.4 self-test - FAILURES"
+            "EQUATIONS v4.9.2 self-test - FAILURES"
         )
     }
 }
@@ -4941,17 +7271,19 @@ SameFaceMultiset(a, b) {
     return true
 }
 
+#HotIf !BotLabWorker
 ^+t::RunRegressionTests()
 ^+b::ShowBotDiagnostics()
+#HotIf
 
 AddLog(message) {
-    global LogLines, LogEdit
+    global LogLines, LogEdit, RenderEnabled
 
     LogLines.Push(message)
 
     while (LogLines.Length > 300)
         LogLines.RemoveAt(1)
 
-    if IsObject(LogEdit)
+    if (RenderEnabled && IsObject(LogEdit))
         LogEdit.Value := JoinArray(LogLines, "`r`n")
 }
