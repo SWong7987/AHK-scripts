@@ -96,12 +96,12 @@ Current v4.12 static verification:
   - LockGoal
 
 RUNTIME STATUS:
-- Windows Ctrl+Shift+T self-test: NOT YET CONFIRMED
+- Windows Ctrl+Shift+T self-test: PASSED 74/74 on 2026-10-01
 - visible 20-shake watch test: NOT YET RUN
 - benchmark: NOT YET RUN
 
 Immediate v4.12 testing order:
-1. Ctrl+Shift+T self-test. Expected: 74 checks passed.
+1. Ctrl+Shift+T self-test: PASSED 74/74.
 2. Visible WATCH BOT GAME, Middle division, 3 Very Hard Bots, 20 shakes, fixed seed.
 3. Inspect PROTECT / PRESSURE / CHASE, plan-state, and witness diagnostics.
 4. Standard 10-shake benchmark with seed 1576201967.
