@@ -1219,7 +1219,7 @@ CopyPcBenchmarkResults(*) {
     global BenchmarkSummary
     A_Clipboard := BenchmarkSummary
     ClipWait(1)
-    MsgBox("PC benchmark results copied to the clipboard.", "EQUATIONS v4.12 EXPERIMENTAL"
+    MsgBox("PC benchmark results copied to the clipboard.", "EQUATIONS v4.12 EXPERIMENTAL")
 }
 
 OpenPcBenchmarkFolder(*) {
@@ -1630,7 +1630,7 @@ CopyBotLabControllerSummary(*) {
     global BotLabControllerSummary
     A_Clipboard := BotLabControllerSummary
     ClipWait(1)
-    MsgBox("Bot Lab controller summary copied to the clipboard.", "EQUATIONS v4.12 EXPERIMENTAL"
+    MsgBox("Bot Lab controller summary copied to the clipboard.", "EQUATIONS v4.12 EXPERIMENTAL")
 }
 
 
