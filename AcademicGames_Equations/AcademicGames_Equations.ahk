@@ -7251,6 +7251,7 @@ RunRegressionTests(*) {
     global Division, PhysicalCubeFaces, ColorFaces, PlayerCount, PlayerTypes, Cubes, BotCachedEquationEntries
     global SeededRandomEnabled, SeedState, SessionSeed
     global Totals, ShakeDelta
+    global BotStrategyWitnesses
 
     originalDivision := Division
     failures := []
