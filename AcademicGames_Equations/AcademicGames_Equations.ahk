@@ -7252,6 +7252,7 @@ RunRegressionTests(*) {
     global SeededRandomEnabled, SeedState, SessionSeed
     global Totals, ShakeDelta
     global BotStrategyWitnesses
+    global BotStrategyWitnesses
 
     originalDivision := Division
     failures := []
