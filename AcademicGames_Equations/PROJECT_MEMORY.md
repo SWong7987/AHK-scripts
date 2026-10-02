@@ -41,36 +41,72 @@ v4.9.2 regression result:
 v4.9.2 performance checkpoint:
 18.77 shakes/sec at 22 workers using the standard 10-shake QUICK benchmark described later in this document.
 
-CURRENT EXPERIMENTAL BUILD:
-v4.10
+CURRENT EXPERIMENTAL GITHUB BRANCH:
+bot/v4.12-strategy-recovery
 
-v4.10 is NOT the canonical GitHub source yet and must not be described as promoted unless a later commit explicitly does so.
+Current experimental header:
+v4.12 EXPERIMENTAL
 
-Current v4.10 local filename used in the prior chat:
-AcademicGames_Equations_Hotseat_v4.10.ahk
+Current experimental commit:
+9ac9f9d6de2b3089bbbd69fceb251077df30beb2
 
-Current v4.10 local source size:
-257,673 bytes
+Current experimental blob:
+a89dc91905f47b231e7bd7bc756670aee835f726
 
-Current v4.10 SHA-256:
-e9e38c3ba58790f719b40d0adbb61bcf4d6133de8407b30581e12129f485f3cd
+IMPORTANT CONTINUITY NOTE:
+The previous oversized chat produced local v4.10 and v4.11 experimental builds, but those exact .ahk artifacts were never committed to GitHub and are not recoverable byte-for-byte in the new chat. v4.12 is therefore a deliberate reconstruction and continuation from the verified v4.9.2 GitHub checkpoint using this memory document plus the pasted prior-chat history. Do NOT describe v4.12 as byte-identical to the lost v4.10/v4.11 files.
 
-Current v4.10 static verification:
-- 242 functions
-- 242 unique function names
-- balanced parentheses, brackets, and braces
-- important referee/parser/scoring functions were intentionally left byte-identical to v4.9.2
-- expected self-test count: 74 checks
+Recovered v4.10 design:
+- bounded per-seat equation witnesses, approximately six
+- FLEXIBILITY / PRESSURE / STABILIZE / ENDGAME plan states
+- reuse proof before launching fresh randomized searches
+- remembered equations can prove IMPOSSIBLE defense or expose NOW danger cheaply
 
-IMPORTANT:
-At the time this memory file was created, the user had NOT YET reported the v4.10 Windows runtime self-test or benchmark result. A future chat must not invent a passing v4.10 runtime result. If exact v4.10 source changes are needed and it is still not on GitHub, ask the user to re-upload the exact v4.10 file and verify its SHA-256 against the value above.
+Recovered v4.11 design:
+- score-aware match states PROTECT / PRESSURE / CHASE
+- leaders favor safe restriction and forceout simplification
+- tied or trailing bots increase evidence-backed Required pressure and Bonus aggression
+- Permitted is not the default passive lane when a strong proven plan exists
 
-Immediate v4.10 testing order:
-1. Ctrl+Shift+T self-test. Expected: 74 checks passed.
+v4.12 continuation:
+- reconstructs both witness memory and score-aware strategy on GitHub
+- solver results now carry exact cube indices so witnesses can be cheaply revalidated
+- Goal, shared-NOW, chosen-move, writer-search, Bonus, and endgame work can feed memory
+- candidate scoring measures how many known witnesses survive
+- Forbidden receives a strong penalty when it destroys every remembered witness
+- Required receives extra value when known witnesses survive it
+- tactical evaluation checks memory before randomized NOW/IMPOSSIBLE search
+- final-cube FORCEOUT reuses a remembered witness before searching
+- six deterministic regressions were added to the old 68, so expected count is 74
+
+Current v4.12 static verification:
+- 243 functions
+- 243 unique function names
+- no duplicate function definitions
+- core referee/parser/scoring functions were compared against stable v4.9.2 and are unchanged:
+  - CheckBoardEquation
+  - CheckPresentedGoal
+  - CheckBoardCubeUsage
+  - ParseExpression
+  - SafePower
+  - StartChallenge
+  - FinalizeShake
+  - ScoreForceout
+  - PlaceSelected
+  - LockGoal
+
+RUNTIME STATUS:
+- Windows Ctrl+Shift+T self-test: PASSED 74/74 on 2026-10-01
+- visible 20-shake watch test: NOT YET RUN
+- benchmark: NOT YET RUN
+
+Immediate v4.12 testing order:
+1. Ctrl+Shift+T self-test: PASSED 74/74.
 2. Visible WATCH BOT GAME, Middle division, 3 Very Hard Bots, 20 shakes, fixed seed.
-3. Inspect plan diagnostics and behavior.
+3. Inspect PROTECT / PRESSURE / CHASE, plan-state, and witness diagnostics.
 4. Standard 10-shake benchmark with seed 1576201967.
-5. Only run longer tests if something useful remains uncertain.
+5. Compare against stable v4.9.2 = 18.77 shakes/sec at 22 workers.
+6. Do not promote to main until behavior and runtime tests are good.
 
 ---
 
@@ -890,6 +926,11 @@ The ChatGPT container does not have a reliable Windows AutoHotkey runtime, so Wi
 ---
 
 # 28. VERSION HISTORY SUMMARY
+
+
+Recent continuation note:
+- v4.11 was a local experimental build from the previous chat, based on v4.10 witness memory plus PROTECT / PRESSURE / CHASE score-state strategy. Its exact source was not committed and is not recoverable byte-for-byte.
+- v4.12 EXPERIMENTAL is the first GitHub-persisted reconstruction/continuation of that line, on branch `bot/v4.12-strategy-recovery`.
 
 v4.0
 - stable native Windows Button cube controls

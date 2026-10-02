@@ -2,7 +2,7 @@
 #SingleInstance Off
 
 ; ============================================================================
-; ACADEMIC GAMES EQUATIONS - LOCAL HOT-SEAT PRACTICE v4.9.2
+; ACADEMIC GAMES EQUATIONS - LOCAL HOT-SEAT PRACTICE v4.12 EXPERIMENTAL
 ; AutoHotkey v2.0
 ;
 ; Basic EQUATIONS only - NO Adventurous variations yet.
@@ -195,6 +195,12 @@ global BotSearchSuccesses := 0
 global BotSearchFailures := 0
 global BotDiagnosticLines := []
 global BotCachedEquationEntries := Map()
+
+; v4.12 experimental strategy recovery.
+; Rebuilds the documented v4.10/v4.11 witness-memory + match-state design on
+; the verified v4.9.2 GitHub checkpoint.  main remains the stable release.
+global BotStrategyWitnesses := Map()
+global BotStrategyWitnessLimit := 6
 
 ; v4.8 solver cache. The key includes Division and the exact physical Goal
 ; expression, so cached interpretations automatically invalidate when either changes.
@@ -431,7 +437,7 @@ ChooseStartupMode() {
     global StartupModeChoice
 
     StartupModeChoice := ""
-    g := Gui("+AlwaysOnTop", "Academic Games EQUATIONS v4.9.2")
+    g := Gui("+AlwaysOnTop", "Academic Games EQUATIONS v4.12 EXPERIMENTAL")
     g.SetFont("s10", "Segoe UI")
     g.Add("Text", "x20 y16 w560 h34 Center", "Choose how you want to run EQUATIONS")
     g.Add("Text", "x25 y49 w550 h42 Center", "Play, watch one lightning-fast bot table, unleash many tables, or benchmark the best worker count for this PC.")
@@ -976,7 +982,7 @@ BuildBenchmarkStages(maxWorkers, profile := "QUICK") {
 BuildPcBenchmarkGui() {
     global BenchmarkGui, BenchmarkEdit, BenchmarkStatusText, BenchmarkProgressBar
 
-    BenchmarkGui := Gui("", "EQUATIONS v4.9.2 - PC Benchmark")
+    BenchmarkGui := Gui("", "EQUATIONS v4.12 EXPERIMENTAL - PC Benchmark")
     BenchmarkGui.SetFont("s10", "Segoe UI")
     BenchmarkGui.OnEvent("Close", PcBenchmarkClose)
 
@@ -1213,7 +1219,7 @@ CopyPcBenchmarkResults(*) {
     global BenchmarkSummary
     A_Clipboard := BenchmarkSummary
     ClipWait(1)
-    MsgBox("PC benchmark results copied to the clipboard.", "EQUATIONS v4.9.2")
+    MsgBox("PC benchmark results copied to the clipboard.", "EQUATIONS v4.12 EXPERIMENTAL")
 }
 
 OpenPcBenchmarkFolder(*) {
@@ -1510,7 +1516,7 @@ BuildBotLabControllerGui() {
     global BotLabControllerGui, BotLabControllerEdit, BotLabControllerStatusText, BotLabControllerConfig
 
     cfg := BotLabControllerConfig
-    BotLabControllerGui := Gui("", "EQUATIONS v4.9.2 - Multi-Instance Bot Lab")
+    BotLabControllerGui := Gui("", "EQUATIONS v4.12 EXPERIMENTAL - Multi-Instance Bot Lab")
     BotLabControllerGui.SetFont("s10", "Segoe UI")
     BotLabControllerGui.OnEvent("Close", BotLabControllerClose)
 
@@ -1624,7 +1630,7 @@ CopyBotLabControllerSummary(*) {
     global BotLabControllerSummary
     A_Clipboard := BotLabControllerSummary
     ClipWait(1)
-    MsgBox("Bot Lab controller summary copied to the clipboard.", "EQUATIONS v4.9.2")
+    MsgBox("Bot Lab controller summary copied to the clipboard.", "EQUATIONS v4.12 EXPERIMENTAL")
 }
 
 
@@ -1655,7 +1661,7 @@ CopyAllBotLabMoves(*) {
     }
 
     blocks := []
-    blocks.Push("EQUATIONS v4.9.2 - ALL BOT MOVES")
+    blocks.Push("EQUATIONS v4.12 EXPERIMENTAL - ALL BOT MOVES")
     blocks.Push("Run ID: " . cfg["RunId"])
     blocks.Push("Base seed: " . cfg["BaseSeed"])
     blocks.Push("Workers: " . BotLabWorkerPids.Length . " | Shakes/worker: " . cfg["Shakes"])
@@ -2062,6 +2068,11 @@ BotTakeGoalTurn(player) {
 
     GoalGroupingEdit.Value := (candidate.Indices.Length > 1) ? candidate.Expr : ""
     LockGoal()
+
+    if (PlayerTypeName(player) = "Very Hard Bot" && candidate.HasOwnProp("WitnessEntry")) {
+        BotHardStoreWitness(player, candidate.WitnessEntry, "goal")
+        BotHardRefreshWitnesses(player)
+    }
 }
 
 BotChooseGoalCandidate(player) {
@@ -2162,6 +2173,14 @@ BotChooseGoalCandidate(player) {
             score := BotHardGoalStrategicScore(candidate, solution)
             candidate.StrategicScore := score
             candidate.WitnessCubes := solution.OK ? solution.Indices.Length : 0
+            if solution.OK {
+                candidate.WitnessEntry := {
+                    Submitted: true,
+                    Solution: solution.Expr,
+                    Goal: candidate.Expr,
+                    Indices: BotCopyArray(solution.Indices)
+                }
+            }
         } else if (playerType = "Rules Fuzzer")
             score += candidate.Indices.Length * 3
         else if (playerType = "Parser Fuzzer")
@@ -2325,6 +2344,199 @@ BotHardGoalStrategicScore(candidate, solution) {
     return score
 }
 
+BotHardGetWitnessArray(player) {
+    global BotStrategyWitnesses
+
+    if !BotStrategyWitnesses.Has(player)
+        BotStrategyWitnesses[player] := []
+    return BotStrategyWitnesses[player]
+}
+
+BotHardWitnessKey(entry) {
+    key := entry.Solution . "=" . entry.Goal . "|"
+    if entry.HasOwnProp("Indices") {
+        for _, idx in entry.Indices
+            key .= idx . ","
+    }
+    return key
+}
+
+BotHardStoreWitness(player, entry, source := "") {
+    global BotStrategyWitnessLimit
+
+    if !entry.Submitted || !entry.HasOwnProp("Indices") || entry.Indices.Length < 2
+        return false
+
+    witnesses := BotHardGetWitnessArray(player)
+    key := BotHardWitnessKey(entry)
+
+    for _, existing in witnesses {
+        if (existing.Key = key)
+            return false
+    }
+
+    copy := {
+        Submitted: true,
+        Solution: entry.Solution,
+        Goal: entry.Goal,
+        Indices: BotCopyArray(entry.Indices),
+        Key: key,
+        Source: source
+    }
+
+    witnesses.Push(copy)
+    while (witnesses.Length > BotStrategyWitnessLimit)
+        witnesses.RemoveAt(1)
+
+    return true
+}
+
+BotHardWitnessSurvives(entry, mode := "IMPOSSIBLE") {
+    global Cubes
+
+    if !entry.Submitted || !entry.HasOwnProp("Indices") || entry.Indices.Length < 2
+        return false
+
+    resourceUse := 0
+
+    for _, idx in entry.Indices {
+        if (idx < 1 || idx > Cubes.Length)
+            return false
+
+        zone := Cubes[idx].Zone
+        if (zone = "Goal" || zone = "Forbidden")
+            return false
+
+        if (zone = "Resources")
+            resourceUse += 1
+
+        if (mode = "FORCEOUT" && zone != "Required" && zone != "Permitted")
+            return false
+    }
+
+    for _, idx in BotIndicesInZone("Required") {
+        if !BotArrayHas(entry.Indices, idx)
+            return false
+    }
+
+    if (mode = "NOW" && resourceUse > 1)
+        return false
+
+    if (mode = "FORCEOUT" && ResourceCount() != 0)
+        return false
+
+    return true
+}
+
+BotHardRefreshWitnesses(player) {
+    global BotStrategyWitnesses
+
+    current := BotHardGetWitnessArray(player)
+    survivors := []
+
+    for _, entry in current {
+        if BotHardWitnessSurvives(entry, "IMPOSSIBLE")
+            survivors.Push(entry)
+    }
+
+    BotStrategyWitnesses[player] := survivors
+    return survivors.Length
+}
+
+BotHardKnownWitness(player, mode := "IMPOSSIBLE") {
+    witnesses := BotHardGetWitnessArray(player)
+
+    for _, entry in witnesses {
+        if BotHardWitnessSurvives(entry, mode)
+            return {Found: true, Entry: entry}
+    }
+
+    return {Found: false, Entry: {Submitted: false, Solution: "", Goal: ""}}
+}
+
+BotHardWitnessCount(player, mode := "IMPOSSIBLE") {
+    count := 0
+    for _, entry in BotHardGetWitnessArray(player) {
+        if BotHardWitnessSurvives(entry, mode)
+            count += 1
+    }
+    return count
+}
+
+BotHardMatchState(player) {
+    gap := BotHardScoreGap(player)
+
+    if (gap < 0)
+        return "PROTECT"
+    if (gap >= 3)
+        return "CHASE"
+    return "PRESSURE"
+}
+
+BotHardPlanState(player) {
+    resources := ResourceCount()
+    witnesses := BotHardWitnessCount(player, "IMPOSSIBLE")
+
+    if (resources <= 4)
+        return "ENDGAME"
+
+    if (witnesses = 0)
+        return "FLEXIBILITY"
+
+    if (witnesses = 1 && (CountZone("Required") >= 4 || BotHardForbiddenDistinctCount() >= 3))
+        return "STABILIZE"
+
+    return "PRESSURE"
+}
+
+BotHardKnownCandidateEvidence(player, idx, zone) {
+    global Cubes
+
+    if (idx < 1 || idx > Cubes.Length || Cubes[idx].Zone != "Resources")
+        return {OK: false, SurvivingWitnesses: 0, DefenseFound: false, NowThreat: false, ForceoutFound: false}
+
+    oldZone := Cubes[idx].Zone
+    Cubes[idx].Zone := zone
+
+    try {
+        survivors := 0
+        defenseFound := false
+        nowThreat := false
+        forceoutFound := false
+        nowLegal := (ResourceCount() >= 2 && (CountZone("Required") + CountZone("Permitted") > 0))
+
+        for _, entry in BotHardGetWitnessArray(player) {
+            if BotHardWitnessSurvives(entry, "IMPOSSIBLE") {
+                survivors += 1
+                defenseFound := true
+            }
+
+            if (nowLegal && BotHardWitnessSurvives(entry, "NOW"))
+                nowThreat := true
+
+            if BotHardWitnessSurvives(entry, "FORCEOUT")
+                forceoutFound := true
+        }
+
+        return {
+            OK: true,
+            SurvivingWitnesses: survivors,
+            DefenseFound: defenseFound,
+            NowThreat: nowThreat,
+            ForceoutFound: forceoutFound
+        }
+    } finally {
+        Cubes[idx].Zone := oldZone
+    }
+}
+
+BotHardStrategySummary(player) {
+    return "match " . BotHardMatchState(player)
+        . "; plan " . BotHardPlanState(player)
+        . "; witnesses " . BotHardWitnessCount(player, "IMPOSSIBLE")
+}
+
+
 BotTakePlayTurn(player) {
     global Phase, CurrentPlayer, SelectedCube, Cubes, BonusUsedThisTurn
 
@@ -2336,10 +2548,13 @@ BotTakePlayTurn(player) {
     if (resources.Length = 0)
         return
 
-    ; v4.9.2: Very Hard uses a selective tactical BONUS instead of a flat percentage. It uses a
-    ; bounded tactical probe and only takes a BONUS when it can already exhibit
-    ; an IMPOSSIBLE-defense Equation and does not expose a NOW witness after the
-    ; BONUS move itself. Other bot personalities retain their old behavior.
+    if (playerType = "Very Hard Bot") {
+        BotHardRefreshWitnesses(player)
+        AddBotDiagnostic(PlayerName(player) . " strategy state: " . BotHardStrategySummary(player) . ".")
+    }
+
+    ; v4.12: Very Hard BONUS remains tactical, but known witnesses can replace
+    ; solver work and tied/trailing match states deliberately raise aggression.
     if (!BonusUsedThisTurn && ResourceCount() > 1 && CanBonus(player)) {
         if (playerType = "Very Hard Bot") {
             bonus := BotChooseHardBonus(player)
@@ -2347,9 +2562,13 @@ BotTakePlayTurn(player) {
                 SelectedCube := bonus.Index
                 AddBotDiagnostic(
                     PlayerName(player) . " chooses strategic BONUS " . CubeCode(Cubes[SelectedCube])
-                    . " -> Forbidden. [strategy " . bonus.Score . "; NOW probe clear; IMPOSSIBLE defense witness]"
+                    . " -> Forbidden. [strategy " . bonus.Score . "; " . BotHardStrategySummary(player) . "]"
                 )
                 BonusSelected()
+
+                if bonus.HasOwnProp("Witness") && bonus.Witness.Submitted
+                    BotHardStoreWitness(player, bonus.Witness, "bonus")
+                BotHardRefreshWitnesses(player)
                 return
             }
         } else {
@@ -2381,10 +2600,18 @@ BotTakePlayTurn(player) {
     if (playerType = "Very Hard Bot" && move.HasOwnProp("StrategyScore")) {
         detail := " [strategy " . move.StrategyScore
             . "; NOW probe " . (move.NowThreat ? "THREAT" : "clear")
-            . "; IMPOSSIBLE defense " . (move.DefenseFound ? "witness" : "not found") . "]"
+            . "; IMPOSSIBLE defense " . (move.DefenseFound ? "witness" : "not found")
+            . "; " . BotHardStrategySummary(player) . "]"
     }
+
     AddBotDiagnostic(PlayerName(player) . " chooses " . CubeCode(Cubes[move.Index]) . " -> " . move.Zone . "." . detail)
     PlaceSelected(move.Zone)
+
+    if (playerType = "Very Hard Bot") {
+        if move.HasOwnProp("DefenseWitness") && move.DefenseWitness.Submitted
+            BotHardStoreWitness(player, move.DefenseWitness, "chosen-move")
+        BotHardRefreshWitnesses(player)
+    }
 }
 
 BotChooseOrdinaryMove(player) {
@@ -2418,6 +2645,7 @@ BotChooseOrdinaryMove(player) {
     return {OK: true, Index: idx, Zone: zone}
 }
 
+
 BotChooseHardMove(player, sampleLimit := 7, quick := false) {
     global Cubes
 
@@ -2425,20 +2653,9 @@ BotChooseHardMove(player, sampleLimit := 7, quick := false) {
     if (resources.Length = 0)
         return {OK: false}
 
-    ; Last cube has only two legal destinations. Keep the real FORCEOUT witness
-    ; probe because this decision directly controls the writing position.
     if (resources.Length = 1)
         return BotChooseHardLastCubeMove(player, resources[1], quick)
 
-    ; v4.9.2 strategy pipeline:
-    ;   1) score sampled cube/destination pairs structurally with NO equation search,
-    ;   2) preserve Required/Permitted/Forbidden diversity,
-    ;   3) use only a tiny NOW screen on the shortlist,
-    ;   4) spend the meaningful NOW/IMPOSSIBLE search budget on the best two.
-    ;
-    ; The expensive referee-backed solver is therefore still deciding close tactical
-    ; positions; it simply is not asked the same expensive question for every mediocre
-    ; candidate on the board.
     sampleCount := Min(resources.Length, sampleLimit)
     sample := BotRandomDistinct(resources, sampleCount)
     cheapCandidates := []
@@ -2457,9 +2674,6 @@ BotChooseHardMove(player, sampleLimit := 7, quick := false) {
     shortlist := BotHardBuildDiverseShortlist(cheapCandidates, shortlistCount)
     tacticallyScored := []
 
-    ; First pass is NOW-only. A found threat is hard evidence and gets the normal
-    ; large tactical penalty. Defense searching is intentionally deferred to the
-    ; finalists, because doing it on every candidate was mostly failed work.
     for _, candidate in shortlist {
         eval := BotHardEvaluateMove(
             player,
@@ -2478,7 +2692,8 @@ BotChooseHardMove(player, sampleLimit := 7, quick := false) {
             BaseScore: candidate.Score,
             Score: eval.Score,
             NowThreat: eval.NowThreat,
-            DefenseFound: false
+            DefenseFound: eval.DefenseFound,
+            DefenseWitness: eval.DefenseWitness
         })
     }
 
@@ -2495,11 +2710,10 @@ BotChooseHardMove(player, sampleLimit := 7, quick := false) {
                 OK: true,
                 Score: candidate.Score,
                 NowThreat: candidate.NowThreat,
-                DefenseFound: false
+                DefenseFound: candidate.DefenseFound,
+                DefenseWitness: candidate.DefenseWitness
             }
         } else {
-            ; Only the best two positions pay for real tactical confirmation.
-            ; Positive NOW evidence from the first pass remains sticky.
             deep := BotHardEvaluateMove(
                 player,
                 candidate.Index,
@@ -2525,7 +2739,8 @@ BotChooseHardMove(player, sampleLimit := 7, quick := false) {
                 OK: true,
                 Score: finalScore,
                 NowThreat: combinedThreat,
-                DefenseFound: deep.DefenseFound
+                DefenseFound: deep.DefenseFound,
+                DefenseWitness: deep.DefenseWitness
             }
         }
 
@@ -2537,7 +2752,8 @@ BotChooseHardMove(player, sampleLimit := 7, quick := false) {
                 Zone: candidate.Zone,
                 StrategyScore: finalEval.Score,
                 NowThreat: finalEval.NowThreat,
-                DefenseFound: finalEval.DefenseFound
+                DefenseFound: finalEval.DefenseFound,
+                DefenseWitness: finalEval.DefenseWitness
             }
         }
     }
@@ -2615,6 +2831,7 @@ BotHardTakeTopCandidates(candidates, limit) {
     return result
 }
 
+
 BotHardCheapMoveScore(player, idx, zone) {
     global Cubes
 
@@ -2627,57 +2844,76 @@ BotHardCheapMoveScore(player, idx, zone) {
     alreadyForbidden := BotHardFaceIsInZone(face, "Forbidden")
     alreadyRequired := BotHardFaceIsInZone(face, "Required")
     requiredFaceCount := BotHardFaceCountInZone(face, "Required")
+    matchState := BotHardMatchState(player)
+    planState := BotHardPlanState(player)
+    currentWitnesses := BotHardWitnessCount(player, "IMPOSSIBLE")
+    evidence := BotHardKnownCandidateEvidence(player, idx, zone)
 
     score := 0
 
     if (zone = "Required") {
-        ; Required is a powerful constraint, not a generic "good" destination.
-        ; v4.9.1 started digits around 14-15 points and therefore stacked long
-        ; Required runs before considering anything else. Start close to Permitted
-        ; and sharply reduce the value of each additional mandatory cube.
         score += 7
         score += IsDigitFace(face) ? 3 : 2
 
         if alreadyForbidden
             score -= 18
-
-        ; Requiring another copy of a face that is already mandatory is a much
-        ; stronger restriction than introducing a new ingredient.
         if (requiredFaceCount > 0)
             score -= requiredFaceCount * 4
-
-        ; Three Required cubes are already a meaningful equation skeleton. Past
-        ; that point, flexibility becomes strategically valuable very quickly.
         if (requiredCount >= 3)
             score -= (requiredCount - 2) * 2
         if (requiredCount >= 6)
             score -= (requiredCount - 5) * 2
-
-        ; Long digit-only Required piles were a common v4.9.1 failure pattern.
         if (IsDigitFace(face) && requiredCount >= 4)
             score -= 2
-
-        ; If Required is already dominating the optional pool, stop feeding it.
         if (requiredCount >= permittedCount + 4)
             score -= 3
+
+        ; Evidence-backed Required pressure: a known surviving Equation is what
+        ; turns an extra mandatory cube from blind aggression into a plan.
+        if (planState = "FLEXIBILITY")
+            score -= 4
+        else if (evidence.DefenseFound) {
+            score += 8 + (Min(evidence.SurvivingWitnesses, 3) * 3)
+            if (planState = "PRESSURE")
+                score += 5
+            else if (planState = "ENDGAME")
+                score += 3
+        }
+
+        if (matchState = "PROTECT")
+            score -= 3
+        else if (matchState = "PRESSURE" && evidence.DefenseFound)
+            score += 3
+        else if (matchState = "CHASE" && evidence.DefenseFound)
+            score += 7
+
     } else if (zone = "Permitted") {
-        ; Permitted preserves options for both tactical NOW play and final writing.
-        ; It should become increasingly attractive as mandatory constraints pile up.
-        score += 8
+        ; Permitted remains the recovery lane when Very Hard has no proof.
+        ; Once it has robust witnesses, high-level play should not drift into
+        ; passive Permitted placement merely because it is comfortable.
+        score += 5
         if alreadyForbidden
             score -= 12
         if (requiredCount >= 3)
-            score += Min(requiredCount - 2, 4)
-        if (forbiddenCount >= 4)
-            score += 2
+            score += Min(requiredCount - 2, 3)
         if (ResourceCount() <= 6)
             score += 2
         if (permittedCount >= 9)
             score -= (permittedCount - 8)
+
+        if (planState = "FLEXIBILITY")
+            score += 6
+        else if (planState = "STABILIZE")
+            score += 4
+        else if (planState = "PRESSURE")
+            score -= 4
+
+        if (matchState = "PRESSURE")
+            score -= 3
+        else if (matchState = "CHASE")
+            score -= 6
+
     } else {
-        ; Denial remains a real strategic option, but repeated/saturated Forbidden
-        ; faces are penalized so it competes with Required and Permitted rather than
-        ; replacing them.
         score += 3 + BotHardFaceDenialValue(face)
         score -= BotHardForbiddenPressurePenalty(
             distinctForbidden,
@@ -2685,18 +2921,37 @@ BotHardCheapMoveScore(player, idx, zone) {
             alreadyForbidden,
             gap
         )
+
         if alreadyRequired
             score -= 14
         if IsDigitFace(face)
             score -= 2
-        if (gap > 0)
-            score += Min(gap, 4)
+
+        ; Protect known work.  A Forbidden move that destroys every remembered
+        ; Equation is expensive; one that preserves several can be a strong
+        ; operator-denial / forceout-simplification move.
+        if (currentWitnesses > 0 && evidence.SurvivingWitnesses = 0)
+            score -= 34
+        else if (evidence.DefenseFound)
+            score += Min(evidence.SurvivingWitnesses, 3) * 3
+
+        if (matchState = "PROTECT" && evidence.DefenseFound)
+            score += 9
+        else if (matchState = "PRESSURE" && evidence.DefenseFound)
+            score += 3
+        else if (matchState = "CHASE" && evidence.DefenseFound)
+            score += 5
     }
 
-    ; Tiny seeded tie-break only. It cannot overwhelm the structural score.
+    ; A remembered Equation that would already satisfy NOW after this move is
+    ; positive proof of danger and needs no randomized NOW probe.
+    if evidence.NowThreat
+        score -= 120
+
     score += EqRandomInt(-1, 1)
     return score
 }
+
 
 BotHardEvaluateMove(player, idx, zone, nowTrials := 8, defenseTrials := 12, baseScore := "") {
     global Cubes
@@ -2713,20 +2968,33 @@ BotHardEvaluateMove(player, idx, zone, nowTrials := 8, defenseTrials := 12, base
     try {
         remaining := ResourceCount()
         nowLegal := (remaining >= 2 && (CountZone("Required") + CountZone("Permitted") > 0))
-        nowThreat := false
-        defenseFound := false
 
-        if (nowLegal && nowTrials > 0)
+        knownNow := nowLegal ? BotHardKnownWitness(player, "NOW") : {Found: false}
+        nowThreat := knownNow.Found
+
+        if (!nowThreat && nowLegal && nowTrials > 0)
             nowThreat := BotFindBoardEquation("NOW", nowTrials).Submitted
 
-        if (defenseTrials > 0)
-            defenseFound := BotFindBoardEquation("IMPOSSIBLE", defenseTrials).Submitted
+        knownDefense := BotHardKnownWitness(player, "IMPOSSIBLE")
+        defenseFound := knownDefense.Found
+        defenseWitness := knownDefense.Found
+            ? knownDefense.Entry
+            : {Submitted: false, Solution: "", Goal: ""}
+
+        if (!defenseFound && defenseTrials > 0) {
+            searchedDefense := BotFindBoardEquation("IMPOSSIBLE", defenseTrials)
+            if searchedDefense.Submitted {
+                defenseFound := true
+                defenseWitness := searchedDefense
+            }
+        }
 
         return {
             OK: true,
             Score: BotHardComposeMoveScore(player, idx, zone, baseScore, nowThreat, defenseFound, remaining),
             NowThreat: nowThreat,
-            DefenseFound: defenseFound
+            DefenseFound: defenseFound,
+            DefenseWitness: defenseWitness
         }
     } finally {
         Cubes[idx].Zone := oldZone
@@ -2809,6 +3077,7 @@ BotHardForbiddenDistinctCount() {
     return seen.Count
 }
 
+
 BotChooseHardLastCubeMove(player, idx, quick := false) {
     global Cubes
 
@@ -2819,14 +3088,21 @@ BotChooseHardLastCubeMove(player, idx, quick := false) {
     for _, zone in ["Required", "Permitted"] {
         Cubes[idx].Zone := zone
 
-        ; Last-cube placement is important enough for a real FORCEOUT probe, but
-        ; 120 trials is sufficient evidence for a bounded heuristic and avoids the
-        ; old 2 x 180-trial tax at the end of every long shake.
-        trials := quick ? 60 : 120
-        witness := BotFindBoardEquation("FORCEOUT", trials)
+        known := BotHardKnownWitness(player, "FORCEOUT")
+        if known.Found
+            witness := known.Entry
+        else {
+            trials := quick ? 60 : 120
+            witness := BotFindBoardEquation("FORCEOUT", trials)
+        }
 
         score := BotHardCheapMoveScore(player, idx, zone)
         score += witness.Submitted ? 55 : 0
+
+        if (BotHardMatchState(player) = "PROTECT" && witness.Submitted)
+            score += 8
+        if (BotHardMatchState(player) = "CHASE" && !witness.Submitted)
+            score -= 6
 
         if (score > bestScore) {
             bestScore := score
@@ -2836,7 +3112,8 @@ BotChooseHardLastCubeMove(player, idx, quick := false) {
                 Zone: zone,
                 StrategyScore: score,
                 NowThreat: false,
-                DefenseFound: witness.Submitted
+                DefenseFound: witness.Submitted,
+                DefenseWitness: witness
             }
         }
     }
@@ -2845,29 +3122,27 @@ BotChooseHardLastCubeMove(player, idx, quick := false) {
     return best.OK ? best : {OK: true, Index: idx, Zone: "Required"}
 }
 
+
 BotChooseHardBonus(player) {
     global Cubes
 
     resources := BotIndicesInZone("Resources")
     gap := BotHardScoreGap(player)
     distinctForbidden := BotHardForbiddenDistinctCount()
+    matchState := BotHardMatchState(player)
 
-    ; BONUS is powerful because it does not end the turn. v4.9 used it far too
-    ; often, paying for another strategy search and flooding Forbidden. Keep it
-    ; for genuinely high-value denial opportunities instead of treating it as an
-    ; almost automatic extra move.
     if (resources.Length <= 5)
-        return {OK: false}
-    if (distinctForbidden >= 3 && gap <= 0)
         return {OK: false}
 
     cheap := []
     seenFaces := Map()
+
     for _, idx in resources {
         face := Cubes[idx].Face
         if seenFaces.Has(face)
             continue
         seenFaces[face] := true
+
         if BotHardFaceIsInZone(face, "Forbidden")
             continue
         if BotHardFaceIsInZone(face, "Required")
@@ -2875,17 +3150,22 @@ BotChooseHardBonus(player) {
 
         score := 4 + BotHardFaceDenialValue(face)
         score -= BotHardForbiddenPressurePenalty(distinctForbidden, CountZone("Forbidden"), false, gap)
+
         if IsDigitFace(face)
             score -= 4
-        if (gap > 0)
-            score += Min(gap, 4)
+
+        if (matchState = "PRESSURE")
+            score += 5
+        else if (matchState = "CHASE")
+            score += 9
+
         cheap.Push({Index: idx, Score: score})
     }
 
     if (cheap.Length = 0)
         return {OK: false}
 
-    finalists := BotHardTakeTopCandidates(cheap, 1)
+    finalists := BotHardTakeTopCandidates(cheap, Min(2, cheap.Length))
     best := {OK: false}
     bestScore := -1000000
 
@@ -2895,17 +3175,22 @@ BotChooseHardBonus(player) {
         Cubes[idx].Zone := "Forbidden"
 
         try {
-            ; Require positive defense evidence, but search only the strongest
-            ; cheap candidates. This keeps BONUS tactical without doubling the
-            ; cost of nearly every turn.
-            defense := BotFindBoardEquation("IMPOSSIBLE", 10)
+            knownDefense := BotHardKnownWitness(player, "IMPOSSIBLE")
+            if knownDefense.Found
+                defense := knownDefense.Entry
+            else
+                defense := BotFindBoardEquation("IMPOSSIBLE", 10)
+
             if !defense.Submitted
                 continue
 
             remaining := ResourceCount()
             nowLegal := (remaining >= 2 && (CountZone("Required") + CountZone("Permitted") > 0))
-            nowThreat := false
-            if nowLegal
+
+            knownNow := nowLegal ? BotHardKnownWitness(player, "NOW") : {Found: false}
+            nowThreat := knownNow.Found
+
+            if (!nowThreat && nowLegal)
                 nowThreat := BotFindBoardEquation("NOW", 5).Submitted
             if nowThreat
                 continue
@@ -2916,18 +3201,18 @@ BotChooseHardBonus(player) {
 
             if (score > bestScore) {
                 bestScore := score
-                best := {OK: true, Index: idx, Score: score}
+                best := {OK: true, Index: idx, Score: score, Witness: defense}
             }
         } finally {
             Cubes[idx].Zone := oldZone
         }
     }
 
-    ; As the board accumulates restrictions, demand a larger strategic edge from
-    ; BONUS. Trailing players can still take a calculated aggressive shot.
-    threshold := 25 + (distinctForbidden * 4)
-    if (gap > 0)
-        threshold -= Min(gap, 4)
+    threshold := 24 + (distinctForbidden * 3)
+    if (matchState = "PRESSURE")
+        threshold -= 4
+    else if (matchState = "CHASE")
+        threshold -= 8
 
     if (best.OK && best.Score >= threshold)
         return best
@@ -3021,8 +3306,10 @@ BotTryChallengeLastMove() {
                         q := A_Index
                         if (q = LastMover || !IsBotPlayer(q))
                             continue
-                        if (PlayerTypeName(q) = "Very Hard Bot")
+                        if (PlayerTypeName(q) = "Very Hard Bot") {
                             BotCacheEquation(q, "NOW", found)
+                            BotHardStoreWitness(q, found, "shared-NOW")
+                        }
                     }
 
                     ChallengeDDL.Choose(p)
@@ -3098,6 +3385,7 @@ GetNoGoalEquationEntry(player, roleText) {
     return BotGenerateNoGoalEquationEntry(player)
 }
 
+
 BotGenerateEquationEntry(player, mode) {
     global BotSearchTrialsPractice, BotSearchTrialsHard, BotSearchTrialsFuzzer
 
@@ -3108,6 +3396,15 @@ BotGenerateEquationEntry(player, mode) {
     }
 
     playerType := PlayerTypeName(player)
+
+    if (playerType = "Very Hard Bot") {
+        BotHardRefreshWitnesses(player)
+        remembered := BotHardKnownWitness(player, mode)
+        if remembered.Found {
+            AddBotDiagnostic(PlayerName(player) . " reuses remembered " . mode . " witness: " . remembered.Entry.Solution . " = " . remembered.Entry.Goal)
+            return remembered.Entry
+        }
+    }
 
     if (playerType = "Parser Fuzzer") {
         if (EqRandom(1, 100) <= 62)
@@ -3125,10 +3422,14 @@ BotGenerateEquationEntry(player, mode) {
         trials := BotSearchTrialsFuzzer
 
     entry := BotFindBoardEquation(mode, trials)
-    if entry.Submitted
+
+    if entry.Submitted {
         AddBotDiagnostic(PlayerName(player) . " found " . mode . " Equation: " . entry.Solution . " = " . entry.Goal)
-    else
+        if (playerType = "Very Hard Bot")
+            BotHardStoreWitness(player, entry, "writer-search")
+    } else {
         AddBotDiagnostic(PlayerName(player) . " found no " . mode . " Equation inside its bounded search budget.")
+    }
 
     return entry
 }
@@ -3259,7 +3560,12 @@ BotFindBoardEquation(mode, trials := 400) {
 
         ; IMPORTANT: the normal referee remains the final acceptance gate. The
         ; optimization only finds candidates faster; it does not bypass rules.
-        entry := {Submitted: true, Solution: exprResult.Expr, Goal: goal.Expr}
+        entry := {
+            Submitted: true,
+            Solution: exprResult.Expr,
+            Goal: goal.Expr,
+            Indices: BotCopyArray(selected)
+        }
         checked := CheckBoardEquation(entry, mode)
         if checked.Correct {
             BotSearchSuccesses += 1
@@ -3697,18 +4003,24 @@ BotArrayWithout(arr, removeArr) {
     return out
 }
 
+
 BotCacheEquation(player, mode, entry) {
     global BotCachedEquationEntries
 
     if !entry.Submitted
         return
 
-    key := player . "|" . mode
-    BotCachedEquationEntries[key] := {
+    copy := {
         Submitted: true,
         Solution: entry.Solution,
         Goal: entry.Goal
     }
+
+    if entry.HasOwnProp("Indices")
+        copy.Indices := BotCopyArray(entry.Indices)
+
+    key := player . "|" . mode
+    BotCachedEquationEntries[key] := copy
 }
 
 BotTakeCachedEquation(player, mode) {
@@ -3723,7 +4035,6 @@ BotTakeCachedEquation(player, mode) {
     return {Found: true, Entry: entry}
 }
 
-
 BotPeekCachedEquation(player, mode) {
     global BotCachedEquationEntries
 
@@ -3733,7 +4044,6 @@ BotPeekCachedEquation(player, mode) {
 
     return {Found: true, Entry: BotCachedEquationEntries[key]}
 }
-
 
 FormatBotMoveLogLine(sequence, shake, phase, message) {
     return "#" . sequence . " | Shake " . shake . " | " . phase . " | " . message
@@ -3807,7 +4117,7 @@ ShowBotDiagnostics(*) {
     text := BuildBotDiagnosticsText()
     A_Clipboard := text
     ClipWait(1)
-    MsgBox("Bot diagnostics copied to the clipboard.`n`nPaste them with Ctrl+V.", "EQUATIONS v4.9.2 - Bot diagnostics")
+    MsgBox("Bot diagnostics copied to the clipboard.`n`nPaste them with Ctrl+V.", "EQUATIONS v4.12 EXPERIMENTAL - Bot diagnostics")
 }
 
 
@@ -3826,7 +4136,7 @@ BuildGui() {
     global OneMinBtn, TwoMinBtn, ResetTimerBtn
     global BotLabWorker, BotLabWorkerId, SessionSeed
 
-    title := "Academic Games EQUATIONS - Digital Tabletop v4.9.2"
+    title := "Academic Games EQUATIONS - Digital Tabletop v4.12 EXPERIMENTAL"
     if BotLabWorker
         title .= " - Worker " . BotLabWorkerId . " - Seed " . SessionSeed
     MainGui := Gui("", title)
@@ -4133,6 +4443,7 @@ StartShake(rotateGoalSetter := true) {
     global ForceoutStartTick
     global BonusUsedThisTurn, ShakeDelta, ChallengeDDL, ZoneOrder
     global BotActionSerial, BotChallengeCheckedSerial, BotCachedEquationEntries
+    global BotStrategyWitnesses
 
     if rotateGoalSetter
         GoalSetter := NextPlayer(GoalSetter)
@@ -4151,6 +4462,7 @@ StartShake(rotateGoalSetter := true) {
     BotActionSerial := 0
     BotChallengeCheckedSerial := 0
     BotCachedEquationEntries := Map()
+    BotStrategyWitnesses := Map()
     ZoneOrder := Map("Required", [], "Permitted", [], "Forbidden", [])
     SetTimer(ForceoutCutoffReached, 0)
     ResetBoardTimer()
@@ -6939,6 +7251,8 @@ RunRegressionTests(*) {
     global Division, PhysicalCubeFaces, ColorFaces, PlayerCount, PlayerTypes, Cubes, BotCachedEquationEntries
     global SeededRandomEnabled, SeedState, SessionSeed
     global Totals, ShakeDelta
+    global BotStrategyWitnesses
+    global BotStrategyWitnesses
 
     originalDivision := Division
     failures := []
@@ -7237,14 +7551,87 @@ RunRegressionTests(*) {
         ShakeDelta := savedShakeDelta
     }
 
+
+    ; v4.12 recovery tests: six cheap deterministic checks cover the new
+    ; match-state and witness-memory layer without requiring a live game.
+
+    savedPlayerCount2 := PlayerCount
+    savedTotals2 := Totals
+    savedShakeDelta2 := ShakeDelta
+    savedCubes2 := Cubes
+    savedWitnesses2 := BotStrategyWitnesses
+
+    try {
+        PlayerCount := 3
+        Totals := [12, 9, 12]
+        ShakeDelta := [0, 0, 0]
+
+        if (BotHardMatchState(1) = "PRESSURE" && BotHardMatchState(2) = "CHASE")
+            passed += 1
+        else
+            failures.Push("v4.12 match-state PRESSURE/CHASE classification failed")
+
+        Totals := [13, 9, 12]
+        if (BotHardMatchState(1) = "PROTECT")
+            passed += 1
+        else
+            failures.Push("v4.12 PROTECT classification failed")
+
+        Cubes := [
+            {Face: "7", Zone: "Required"},
+            {Face: "-", Zone: "Permitted"},
+            {Face: "3", Zone: "Permitted"},
+            {Face: "x", Zone: "Permitted"},
+            {Face: "2", Zone: "Resources"},
+            {Face: "5", Zone: "Resources"},
+            {Face: "+", Zone: "Resources"}
+        ]
+        BotStrategyWitnesses := Map()
+
+        witnessA := {
+            Submitted: true,
+            Solution: "((7-3)x2)",
+            Goal: "8",
+            Indices: [1, 2, 3, 4, 5]
+        }
+
+        if BotHardStoreWitness(1, witnessA, "self-test")
+            passed += 1
+        else
+            failures.Push("v4.12 failed to store a valid strategy witness")
+
+        if (BotHardWitnessCount(1, "IMPOSSIBLE") = 1 && BotHardKnownWitness(1, "IMPOSSIBLE").Found)
+            passed += 1
+        else
+            failures.Push("v4.12 failed to retrieve a surviving strategy witness")
+
+        evidence := BotHardKnownCandidateEvidence(1, 5, "Required")
+        if (evidence.OK && evidence.DefenseFound && evidence.SurvivingWitnesses = 1)
+            passed += 1
+        else
+            failures.Push("v4.12 Required-pressure witness evidence failed")
+
+        Cubes[5].Zone := "Forbidden"
+        if (!BotHardWitnessSurvives(witnessA, "IMPOSSIBLE") && BotHardRefreshWitnesses(1) = 0)
+            passed += 1
+        else
+            failures.Push("v4.12 obsolete witness invalidation failed")
+    } finally {
+        PlayerCount := savedPlayerCount2
+        Totals := savedTotals2
+        ShakeDelta := savedShakeDelta2
+        Cubes := savedCubes2
+        BotStrategyWitnesses := savedWitnesses2
+    }
+
     Division := originalDivision
 
     if (failures.Length = 0) {
-        MsgBox("All " . passed . " v4.9.2 regression checks passed.", "EQUATIONS v4.9.2 self-test")
+        MsgBox("All " . passed . " v4.12 regression checks passed.", "EQUATIONS v4.12 EXPERIMENTAL self-test")
     } else {
         MsgBox(
             passed . " checks passed; " . failures.Length . " failed.`n`n" . JoinArray(failures, "`n"),
-            "EQUATIONS v4.9.2 self-test - FAILURES"
+            "EQUATIONS v4.12 EXPERIMENTAL self-test - FAILURES"
         )
     }
 }
