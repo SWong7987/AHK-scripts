@@ -1,8 +1,10 @@
 name: Package v4.12 experimental
 
 on:
-  pull_request:
-    branches: [main]
+  push:
+    branches:
+      - bot/v4.12-strategy-recovery
+  workflow_dispatch:
 
 permissions:
   contents: read
